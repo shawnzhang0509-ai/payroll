@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4 (Excel multi-sheet payslip import)
+Version: 1.4.1 (scrollable week-id dialog)
 """
 
 import sys
@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QTableWidget, QTableWidgetItem, QComboBox,
     QFileDialog, QMessageBox, QTabWidget, QHeaderView,
     QDialog, QLineEdit, QDialogButtonBox,
+    QScrollArea, QTextEdit,
     QStatusBar, QMenuBar, QMenu,
     QListWidget, QListWidgetItem, QInputDialog
 )
@@ -891,7 +892,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.1")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
@@ -1219,8 +1220,9 @@ class PayrollAnalyzer(QMainWindow):
         for d in all_data:
             preview += f"  {d['name']}: ${d['total_earnings']:.2f} ({len(d['earnings'])}项收入)\n"
 
-        week_id, ok = QInputDialog.getText(self, "设置周ID", 
-            f"{preview}\n请输入周标识 (如: 2026-W18):", text=self.guess_week_id(all_data[0]))
+        week_id, ok = self._prompt_week_id(
+            preview, self.guess_week_id(all_data[0])
+        )
         if not ok or not week_id:
             return
 
@@ -1253,11 +1255,8 @@ class PayrollAnalyzer(QMainWindow):
             nm = d.get('name') or '(未识别姓名)'
             preview += f"  {nm}: ${d.get('total_earnings', 0):.2f} ({len(d.get('earnings', []))}项收入)\n"
 
-        week_id, ok = QInputDialog.getText(
-            self,
-            "设置周ID",
-            f"{preview}\n请输入周标识 (如: 2026-W18):",
-            text=self.guess_week_id(all_data[0]),
+        week_id, ok = self._prompt_week_id(
+            preview, self.guess_week_id(all_data[0])
         )
         if not ok or not week_id:
             return
@@ -1340,6 +1339,46 @@ class PayrollAnalyzer(QMainWindow):
         self.db.save_data()
         self.status.showMessage(f"导入 {len(data)} 条工时记录，更新 {updated} 条工资单工时")
         self.refresh_all()
+
+    def _prompt_week_id(self, preview_text: str, default_week: str):
+        """
+        自定义对话框：预览列表可滚动；避免 QInputDialog 将超长文本放在单行标签里无法下拉。
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("设置周ID")
+        dlg.setMinimumWidth(560)
+        layout = QVBoxLayout(dlg)
+
+        layout.addWidget(QLabel("解析预览（可滚动）:"))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumHeight(320)
+        scroll.setMaximumHeight(480)
+
+        viewer = QTextEdit()
+        viewer.setReadOnly(True)
+        viewer.setPlainText(preview_text.rstrip())
+        viewer.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        scroll.setWidget(viewer)
+        layout.addWidget(scroll)
+
+        layout.addWidget(QLabel("请输入周标识（例如 2026-W18）："))
+        entry = QLineEdit()
+        entry.setText(default_week)
+        layout.addWidget(entry)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        entry.setFocus()
+        entry.selectAll()
+
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        return entry.text().strip(), accepted
 
     def guess_week_id(self, data):
         pay_period = data.get('pay_period', '')
