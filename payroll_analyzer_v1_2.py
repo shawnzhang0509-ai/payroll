@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.1 (scrollable week-id dialog)
+Version: 1.4.2 (week-ID dialog: QTextEdit scroll only)
 """
 
 import sys
@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QTableWidget, QTableWidgetItem, QComboBox,
     QFileDialog, QMessageBox, QTabWidget, QHeaderView,
     QDialog, QLineEdit, QDialogButtonBox,
-    QScrollArea, QTextEdit,
+    QTextEdit,
     QStatusBar, QMenuBar, QMenu,
     QListWidget, QListWidgetItem, QInputDialog
 )
@@ -892,7 +892,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.1")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.2")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
@@ -1342,7 +1342,10 @@ class PayrollAnalyzer(QMainWindow):
 
     def _prompt_week_id(self, preview_text: str, default_week: str):
         """
-        自定义对话框：预览列表可滚动；避免 QInputDialog 将超长文本放在单行标签里无法下拉。
+        自定义对话框：预览区可滚动。
+
+        注意：不要用 QScrollArea 包裹 QTextEdit 且 setWidgetResizable(True)，否则 QTextEdit
+        会为撑满全文无限增高，超长列表时易崩溃；QTextEdit 自带滚动条，限制高度即可。
         """
         dlg = QDialog(self)
         dlg.setWindowTitle("设置周ID")
@@ -1350,17 +1353,12 @@ class PayrollAnalyzer(QMainWindow):
         layout = QVBoxLayout(dlg)
 
         layout.addWidget(QLabel("解析预览（可滚动）:"))
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setMinimumHeight(320)
-        scroll.setMaximumHeight(480)
-
         viewer = QTextEdit()
         viewer.setReadOnly(True)
         viewer.setPlainText(preview_text.rstrip())
-        viewer.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        scroll.setWidget(viewer)
-        layout.addWidget(scroll)
+        viewer.setMinimumHeight(300)
+        viewer.setMaximumHeight(460)
+        layout.addWidget(viewer)
 
         layout.addWidget(QLabel("请输入周标识（例如 2026-W18）："))
         entry = QLineEdit()
@@ -1377,7 +1375,8 @@ class PayrollAnalyzer(QMainWindow):
         entry.setFocus()
         entry.selectAll()
 
-        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        result = dlg.exec()
+        accepted = result == QDialog.DialogCode.Accepted
         return entry.text().strip(), accepted
 
     def guess_week_id(self, data):
