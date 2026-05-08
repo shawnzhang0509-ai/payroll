@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.4 (matplotlib CJK fonts + merged branch keys)
+Version: 1.4.5 (import JSON backup + fix export JSON path)
 """
 
+import copy
 import sys
 import os
 import json
@@ -162,8 +163,8 @@ class PayrollDatabase:
             except Exception as e:
                 print(f"加载历史数据失败: {e}")
 
-    def save_data(self):
-        data = {
+    def build_snapshot(self):
+        return {
             'employees': [
                 {'name': e.name, 'name_key': e.name_key, 'branch': e.branch,
                  'english_name': e.english_name}
@@ -171,11 +172,58 @@ class PayrollDatabase:
             ],
             'branches': list(self.branches),
             'category_mapping': self.mapping_rules,
-            'history': self.history
+            'history': self.history,
         }
-        with open(self.config.get('history_file', 'payroll_history.json'), 
+
+    def save_data(self):
+        with open(self.config.get('history_file', 'payroll_history.json'),
                   'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(self.build_snapshot(), f, ensure_ascii=False, indent=2)
+
+    def import_snapshot(self, data, replace: bool, import_mapping: bool):
+        """从 JSON 字典合并或覆盖；结构与 build_snapshot 一致。"""
+        if replace:
+            self.employees.clear()
+            for ed in data.get('employees', []):
+                nk = ed.get('name_key')
+                if not nk:
+                    continue
+                self.employees[nk] = Employee(
+                    ed.get('name', ''),
+                    nk,
+                    ed.get('branch', '未分配'),
+                    ed.get('english_name', ''),
+                )
+            self.branches = set(data.get('branches', [])) | set(
+                DEFAULT_CONFIG['branches']
+            )
+            self.history = copy.deepcopy(data.get('history', {}))
+        else:
+            for ed in data.get('employees', []):
+                nk = ed.get('name_key')
+                if not nk:
+                    continue
+                if nk in self.employees:
+                    e = self.employees[nk]
+                    e.name = ed.get('name', e.name)
+                    e.branch = ed.get('branch', e.branch)
+                    e.english_name = ed.get('english_name', e.english_name)
+                else:
+                    self.employees[nk] = Employee(
+                        ed.get('name', ''),
+                        nk,
+                        ed.get('branch', '未分配'),
+                        ed.get('english_name', ''),
+                    )
+            self.branches.update(data.get('branches', []))
+            for wk, rows in data.get('history', {}).items():
+                if wk not in self.history:
+                    self.history[wk] = {}
+                for ek, payroll in rows.items():
+                    self.history[wk][ek] = copy.deepcopy(payroll)
+
+        if import_mapping and data.get('category_mapping'):
+            self.mapping_rules = copy.deepcopy(data['category_mapping'])
 
     def get_or_create_employee(self, name, name_key=None, branch="未分配"):
         key = name_key or name.lower().strip()
@@ -942,7 +990,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.4")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.5")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
@@ -983,6 +1031,10 @@ class PayrollAnalyzer(QMainWindow):
         import_excel_action.setShortcut('Ctrl+E')
         import_excel_action.triggered.connect(self.import_excel)
         file_menu.addAction(import_excel_action)
+
+        import_json_action = QAction('导入JSON备份(&J)', self)
+        import_json_action.triggered.connect(self.import_payroll_json)
+        file_menu.addAction(import_json_action)
 
         file_menu.addSeparator()
 
@@ -1030,6 +1082,12 @@ class PayrollAnalyzer(QMainWindow):
         btn_excel.clicked.connect(self.import_excel)
         toolbar.addWidget(btn_excel)
 
+        btn_json = QPushButton("📥 导入JSON备份")
+        btn_json.setStyleSheet("padding: 8px 16px; font-size: 12px;")
+        btn_json.setToolTip("与本程序「导出 JSON」相同格式")
+        btn_json.clicked.connect(self.import_payroll_json)
+        toolbar.addWidget(btn_json)
+
         btn_refresh = QPushButton("🔄 刷新")
         btn_refresh.clicked.connect(self.refresh_all)
         toolbar.addWidget(btn_refresh)
@@ -1057,7 +1115,7 @@ class PayrollAnalyzer(QMainWindow):
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage("就绪 | PDF / Excel工资簿工资单 / Excel工时表")
+        self.status.showMessage("就绪 | PDF/Excel工资单 | Excel工时 | JSON备份")
 
     def create_summary_tab(self):
         widget = QWidget()
@@ -1213,6 +1271,10 @@ class PayrollAnalyzer(QMainWindow):
         btn_delete = QPushButton("🗑️ 删除选中周")
         btn_delete.clicked.connect(self.delete_week)
         btn_layout.addWidget(btn_delete)
+
+        btn_import_json = QPushButton("📥 导入JSON")
+        btn_import_json.clicked.connect(self.import_payroll_json)
+        btn_layout.addWidget(btn_import_json)
 
         btn_export_json = QPushButton("📤 导出JSON")
         btn_export_json.clicked.connect(lambda: self.export_data('json'))
@@ -1428,6 +1490,68 @@ class PayrollAnalyzer(QMainWindow):
         self.db.save_data()
         self.status.showMessage(f"导入 {len(data)} 条工时记录，更新 {updated} 条工资单工时")
         self.refresh_all()
+
+    def import_payroll_json(self):
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "导入JSON备份", "", "JSON Files (*.json)"
+        )
+        if not filepath:
+            return
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, "读取失败", str(e))
+            return
+
+        if not isinstance(data, dict) or 'employees' not in data or 'history' not in data:
+            QMessageBox.warning(
+                self,
+                "格式错误",
+                "JSON 须包含 employees、history 字段（与本程序「导出 JSON」格式一致）。",
+            )
+            return
+
+        mode = QMessageBox(self)
+        mode.setIcon(QMessageBox.Icon.Question)
+        mode.setWindowTitle("导入 JSON")
+        mode.setText(
+            "「合并」：与当前数据合并；同一周、同一员工的工资条以导入文件为准。\n\n"
+            "「完全替换」：清空当前员工与工资历史后再载入（建议先导出备份）。"
+        )
+        btn_merge = mode.addButton("合并", QMessageBox.ButtonRole.YesRole)
+        btn_rep = mode.addButton("完全替换", QMessageBox.ButtonRole.NoRole)
+        btn_cancel = mode.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        mode.exec()
+        clicked = mode.clickedButton()
+        if clicked == btn_cancel:
+            return
+        replace = clicked == btn_rep
+
+        import_mapping = False
+        if data.get('category_mapping'):
+            r = QMessageBox.question(
+                self,
+                "Mapping 规则",
+                "是否同时用文件中的「分类 Mapping」覆盖当前规则？\n"
+                "（选「否」则只导入员工与工资历史）",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            import_mapping = r == QMessageBox.StandardButton.Yes
+
+        try:
+            self.db.import_snapshot(data, replace=replace, import_mapping=import_mapping)
+            if import_mapping:
+                self.config['category_mapping'] = self.db.mapping_rules
+                self.save_config()
+            self.db.save_data()
+            self.refresh_all()
+            self.status.showMessage(f"已从 JSON 载入：{os.path.basename(filepath)}")
+            QMessageBox.information(self, "导入成功", "JSON 数据已写入当前工资库。")
+        except Exception as e:
+            QMessageBox.critical(self, "导入失败", str(e))
+            traceback.print_exc()
 
     @staticmethod
     def _clip_preview_text(text: str, max_lines: int = 500, max_chars: int = 180_000) -> str:
@@ -2013,8 +2137,15 @@ class PayrollAnalyzer(QMainWindow):
                 self, "导出JSON", "payroll_data.json", "JSON Files (*.json)"
             )
             if filepath:
-                self.db.save_data()
-                QMessageBox.information(self, "导出成功", f"数据已保存到:\n{filepath}")
+                try:
+                    snap = self.db.build_snapshot()
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        json.dump(snap, f, ensure_ascii=False, indent=2)
+                    QMessageBox.information(
+                        self, "导出成功", f"数据已保存到:\n{filepath}"
+                    )
+                except Exception as e:
+                    QMessageBox.critical(self, "导出失败", str(e))
         else:
             self.export_report()
 
