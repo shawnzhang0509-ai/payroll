@@ -305,13 +305,31 @@ class PDFPayrollParser:
         if pd_match:
             payment_date = pd_match.group(1).strip()
 
-        te_match = re.search(r'Total Earnings:\s*\$?([\d,]+\.\d+)', text)
-        if te_match:
-            total_earnings = float(te_match.group(1).replace(',', ''))
+        # Summary amounts: many payslips use different labels or omit cents ($5000 vs $5000.00).
+        money_num = r'([\d,]+(?:\.\d{1,2})?)'
 
-        np_match = re.search(r'Net Pay:\s*\$?([\d,]+\.\d+)', text)
-        if np_match:
-            net_pay = float(np_match.group(1).replace(',', ''))
+        def scan_money(label_patterns):
+            for pat in label_patterns:
+                m = re.search(pat, text, re.I | re.MULTILINE)
+                if m:
+                    try:
+                        return float(m.group(1).replace(',', ''))
+                    except ValueError:
+                        continue
+            return 0
+
+        total_earnings = scan_money([
+            rf'Total\s+Earnings:\s*\$?{money_num}',
+            rf'Gross\s+(?:Pay|Earnings|Income):\s*\$?{money_num}',
+            rf'Total\s+Gross:\s*\$?{money_num}',
+            rf'Earnings\s+Total:\s*\$?{money_num}',
+        ])
+
+        net_pay = scan_money([
+            rf'Net\s+Pay:\s*\$?{money_num}',
+            rf'(?:Take\s*Home|Take-home|Net\s+Amount|Amount\s+Payable):\s*\$?{money_num}',
+            rf'Pay\s+into\s+bank:\s*\$?{money_num}',
+        ])
 
         # ========== 核心修复：更智能的收入项目提取 ==========
         earnings = []
@@ -352,7 +370,7 @@ class PDFPayrollParser:
             # 格式2: "Other Earnings          $3,101.34"
             # 格式3: "Holiday Pay             $53.91  $69.72"
 
-            amounts_found = re.findall(r'\$([\d,]+\.\d+)', line)
+            amounts_found = re.findall(r'\$([\d,]+(?:\.\d+)?)', line)
 
             if len(amounts_found) >= 1:
                 # 最后一个金额通常是 "THIS PAY"
@@ -385,6 +403,11 @@ class PDFPayrollParser:
                     'rate': rate,
                     'amount': this_pay
                 })
+
+        # If the payslip uses wording/layout we don't match for totals, use line items.
+        sum_lines = sum(e['amount'] for e in earnings)
+        if total_earnings == 0 and sum_lines > 0:
+            total_earnings = sum_lines
 
         result = {
             'name': name,
