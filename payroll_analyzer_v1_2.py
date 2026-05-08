@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.3 (week-ID preview: plain text + truncation + safe commit)
+Version: 1.4.4 (matplotlib CJK fonts + merged branch keys)
 """
 
 import sys
@@ -48,6 +48,14 @@ try:
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
     MATPLOTLIB_AVAILABLE = True
+    # 中文图例/坐标轴：按顺序使用系统中第一个可用的字体（否则显示为方块）
+    matplotlib.rcParams['font.sans-serif'] = [
+        'Microsoft YaHei', 'Microsoft JhengHei', 'PingFang SC', 'Hiragino Sans GB',
+        'Noto Sans CJK SC', 'Noto Sans CJK TC', 'Noto Sans CJK JP',
+        'WenQuanYi Micro Hei', 'WenQuanYi Zen Hei', 'Source Han Sans SC',
+        'SimHei', 'SimSun', 'Arial Unicode MS', 'DejaVu Sans',
+    ]
+    matplotlib.rcParams['axes.unicode_minus'] = False
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
 
@@ -92,6 +100,34 @@ DEFAULT_CONFIG = {
     },
     "history_file": "payroll_history.json"
 }
+
+
+def branch_canonical_key(name: str) -> str:
+    """同一部门仅大小写、多空格、多个连字符不一致时合并统计。"""
+    if name is None:
+        return '未分配'
+    s = str(name).strip()
+    if not s:
+        return '未分配'
+    s = re.sub(r'-{2,}', '-', s)
+    s = re.sub(r'\s+', ' ', s)
+    return s.lower()
+
+
+def branch_display_label(canonical_key: str, samples: set) -> str:
+    """展示名：含中文则保留原文样本；纯英文则按词首大写统一。"""
+    if canonical_key == '未分配':
+        return '未分配'
+    if not samples:
+        return canonical_key
+    for cand in sorted(samples, key=len, reverse=True):
+        if any('\u4e00' <= c <= '\u9fff' for c in cand):
+            return cand.strip()
+    segs = [p for p in canonical_key.split('-') if p]
+    if segs:
+        return '-'.join(p.capitalize() for p in segs)
+    return next(iter(samples)).strip()
+
 
 class Employee:
     def __init__(self, name, name_key=None, branch="未分配", english_name=""):
@@ -154,11 +190,12 @@ class PayrollDatabase:
             self.save_data()
 
     def get_branch_summary(self, week_id=None):
-        summary = defaultdict(lambda: {
+        by_key = defaultdict(lambda: {
             'labor_cost': 0, 'benefits': 0, 'performance': 0,
             'fixed_salary': 0, 'other': 0, 'total_earnings': 0,
             'hours': 0, 'employee_count': 0, 'net_pay': 0
         })
+        samples = defaultdict(set)
 
         target_weeks = [week_id] if week_id else list(self.history.keys())
 
@@ -169,18 +206,29 @@ class PayrollDatabase:
                 emp = self.employees.get(emp_key)
                 if not emp:
                     continue
-                branch = emp.branch
-                summary[branch]['labor_cost'] += payroll_data.get('labor_cost', 0)
-                summary[branch]['benefits'] += payroll_data.get('benefits', 0)
-                summary[branch]['performance'] += payroll_data.get('performance', 0)
-                summary[branch]['fixed_salary'] += payroll_data.get('fixed_salary', 0)
-                summary[branch]['other'] += payroll_data.get('other', 0)
-                summary[branch]['total_earnings'] += payroll_data.get('total_earnings', 0)
-                summary[branch]['net_pay'] += payroll_data.get('net_pay', 0)
-                summary[branch]['hours'] += payroll_data.get('hours', 0)
-                summary[branch]['employee_count'] += 1
+                ck = branch_canonical_key(emp.branch)
+                samples[ck].add(str(emp.branch).strip())
 
-        return dict(summary)
+                by_key[ck]['labor_cost'] += payroll_data.get('labor_cost', 0)
+                by_key[ck]['benefits'] += payroll_data.get('benefits', 0)
+                by_key[ck]['performance'] += payroll_data.get('performance', 0)
+                by_key[ck]['fixed_salary'] += payroll_data.get('fixed_salary', 0)
+                by_key[ck]['other'] += payroll_data.get('other', 0)
+                by_key[ck]['total_earnings'] += payroll_data.get('total_earnings', 0)
+                by_key[ck]['net_pay'] += payroll_data.get('net_pay', 0)
+                by_key[ck]['hours'] += payroll_data.get('hours', 0)
+                by_key[ck]['employee_count'] += 1
+
+        merged = {}
+        for ck, data in by_key.items():
+            label = branch_display_label(ck, samples[ck])
+            if label not in merged:
+                merged[label] = dict(data)
+            else:
+                for k in data:
+                    merged[label][k] += data[k]
+
+        return merged
 
 # ============================================================
 # PDF text extraction: pdfplumber + PyMuPDF fallback (scanned PDFs still need OCR)
@@ -894,7 +942,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.3")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.4")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
