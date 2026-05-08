@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.2 (PDF Parser Fixed)
+Version: 1.3 (PDF dual-engine extraction)
 """
 
 import sys
@@ -31,6 +31,12 @@ try:
     PDF_AVAILABLE = True
 except ImportError:
     PDF_AVAILABLE = False
+
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
 
 try:
     import matplotlib
@@ -174,26 +180,96 @@ class PayrollDatabase:
         return dict(summary)
 
 # ============================================================
-# FIXED PDF PARSER
+# PDF text extraction: pdfplumber + PyMuPDF fallback (scanned PDFs still need OCR)
 # ============================================================
+
+MIN_PDF_TEXT_CHARS = 40
+
+
+def _pdf_text_pdfplumber(filepath):
+    """Extract text with tolerances; layout mode helps some payroll PDFs."""
+    chunks = []
+    with pdfplumber.open(filepath) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text(x_tolerance=2, y_tolerance=2)
+            if not t:
+                t = page.extract_text(layout=True)
+            if not t:
+                t = page.extract_text()
+            if t:
+                chunks.append(t)
+    return "\n".join(chunks)
+
+
+def _pdf_text_pymupdf(filepath):
+    doc = fitz.open(filepath)
+    try:
+        parts = []
+        for page in doc:
+            parts.append(page.get_text("text"))
+        return "\n".join(parts)
+    finally:
+        doc.close()
+
+
+def extract_pdf_text(filepath):
+    """
+    Return (text, error_message). Chooses the longest non-empty extraction
+    between pdfplumber and PyMuPDF—many payroll PDFs work with only one engine.
+    """
+    path = Path(filepath)
+    if not path.is_file():
+        return None, f"找不到文件或无法读取: {filepath}"
+
+    candidates = []
+    errors = []
+
+    if PDF_AVAILABLE:
+        try:
+            candidates.append(_pdf_text_pdfplumber(filepath))
+        except Exception as e:
+            errors.append(f"pdfplumber: {e}")
+
+    if PYMUPDF_AVAILABLE:
+        try:
+            candidates.append(_pdf_text_pymupdf(filepath))
+        except Exception as e:
+            errors.append(f"PyMuPDF: {e}")
+
+    if not candidates:
+        msg = "无法读取PDF（请安装: pip install pdfplumber pymupdf）。"
+        if errors:
+            msg += " " + " ".join(errors)
+        return None, msg
+
+    text = max(candidates, key=lambda s: len((s or "").strip()))
+
+    if len(text.strip()) < MIN_PDF_TEXT_CHARS:
+        msg = (
+            "从PDF中提取的文字过少。常见原因：1) 扫描件/图片型工资单（需先用OCR生成可选中文字）；"
+            "2) 加密或权限受限的PDF。"
+        )
+        if errors:
+            msg += " 解析器报错: " + " ".join(errors)
+        return None, msg
+
+    return text, None
+
 
 class PDFPayrollParser:
     @staticmethod
     def parse_pdf(filepath):
-        if not PDF_AVAILABLE:
-            return None, "pdfplumber not installed. Run: pip install pdfplumber"
+        if not PDF_AVAILABLE and not PYMUPDF_AVAILABLE:
+            return None, "请至少安装其一: pip install pdfplumber 或 pip install pymupdf"
 
-        try:
-            with pdfplumber.open(filepath) as pdf:
-                all_text = ""
-                for page in pdf.pages:
-                    text = page.extract_text()
-                    if text:
-                        all_text += text + "\n"
+        text, ext_err = extract_pdf_text(filepath)
+        if ext_err:
+            return None, ext_err
 
-                return PDFPayrollParser.parse_text(all_text)
-        except Exception as e:
-            return None, str(e)
+        data, parse_err = PDFPayrollParser.parse_text(text)
+        if parse_err:
+            return None, parse_err
+        return data, None
 
     @staticmethod
     def parse_text(text):
@@ -206,10 +282,20 @@ class PDFPayrollParser:
         total_earnings = 0
         net_pay = 0
 
-        # 更宽松的正则
-        name_match = re.search(r'EMPLOYMENT DETAILS\s*\n?([^\n]+)', text)
+        # 姓名：多种常见工资单抬头
+        name_match = re.search(r'EMPLOYMENT DETAILS\s*\n?\s*([^\n]+)', text)
         if name_match:
             name = name_match.group(1).strip()
+        if not name:
+            for pattern in (
+                r'Employee\s*Name\s*[:\s]+\s*([^\n]+)',
+                r'(?:Full\s*Name|Staff\s*Name)\s*[:\s]+\s*([^\n]+)',
+                r'EMPLOYEE\s*[:\s]+\s*([^\n]+)',
+            ):
+                m = re.search(pattern, text, re.I)
+                if m:
+                    name = m.group(1).strip()
+                    break
 
         pp_match = re.search(r'Pay Period:\s*([\d\s\w\-–]+)', text)
         if pp_match:
@@ -300,14 +386,27 @@ class PDFPayrollParser:
                     'amount': this_pay
                 })
 
-        return {
+        result = {
             'name': name,
             'pay_period': pay_period,
             'payment_date': payment_date,
             'total_earnings': total_earnings,
             'net_pay': net_pay,
             'earnings': earnings
-        }, None
+        }
+
+        if (
+            not name
+            and not earnings
+            and total_earnings == 0
+            and net_pay == 0
+        ):
+            return None, (
+                "已从PDF提取文字，但未匹配到姓名或收入行。可能版式与内置规则不一致；"
+                "若为扫描版请先使用OCR。可将提取样本导出以便调整解析规则。"
+            )
+
+        return result, None
 
 class ExcelHoursImporter:
     @staticmethod
@@ -336,7 +435,7 @@ class ExcelHoursImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.2")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.3")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
@@ -618,8 +717,11 @@ class PayrollAnalyzer(QMainWindow):
         return widget
 
     def import_pdf(self):
-        if not PDF_AVAILABLE:
-            QMessageBox.warning(self, "缺少依赖", "请安装pdfplumber: pip install pdfplumber")
+        if not PDF_AVAILABLE and not PYMUPDF_AVAILABLE:
+            QMessageBox.warning(
+                self, "缺少依赖",
+                "请至少安装其一:\n  pip install pdfplumber\n  pip install pymupdf",
+            )
             return
 
         files, _ = QFileDialog.getOpenFileNames(
