@@ -352,7 +352,9 @@ class PDFPayrollParser:
             # 格式2: "Other Earnings          $3,101.34"
             # 格式3: "Holiday Pay             $53.91  $69.72"
 
-            amounts_found = re.findall(r'\$([\d,]+\.\d+)', line)
+            amounts_found = re.findall(r'\$([\d,]+(?:\.\d+)?)', line)
+            if not amounts_found:
+                amounts_found = re.findall(r'(?:^|\s)([\d,]+\.\d{2})(?=\s|$)', line)
 
             if len(amounts_found) >= 1:
                 # 最后一个金额通常是 "THIS PAY"
@@ -492,44 +494,166 @@ class ExcelPayslipImporter:
     def _find_pay_period_row(rows):
         for ri, row in enumerate(rows):
             for c in row:
-                if c is not None and 'pay period' in str(c).lower():
-                    return ri
-        return None
-
-    @staticmethod
-    def _find_earnings_header_row(rows):
-        for ri, row in enumerate(rows):
-            joined = ' '.join(str(c).lower() for c in row if c is not None)
-            if 'earnings' in joined and 'quantity' in joined:
-                if 'this pay' in joined or 'rate' in joined:
+                if c is None:
+                    continue
+                low = str(c).lower()
+                if 'pay period' in low and 'tax period' not in low:
                     return ri
         return None
 
     @classmethod
+    def _find_earnings_columns(cls, rows):
+        """
+        Locate THIS PAY / YTD columns (often on same row; Xero 也可能拆成两行表头).
+        Returns (header_last_row_idx, data_start_row, this_pay_col, ytd_col, qty_col, rate_col)
+        """
+        this_pay_col = ytd_col = qty_col = rate_col = None
+        header_last = None
+
+        for ri, row in enumerate(rows):
+            tp = yt = qc = rc = None
+            for ci, c in enumerate(row):
+                if cls._is_na(c):
+                    continue
+                t = str(c).strip().lower()
+                t = re.sub(r'\s+', ' ', t)
+                if t in ('this pay',) or t.startswith('this pay'):
+                    tp = ci
+                elif t == 'ytd':
+                    yt = ci
+                elif 'quantity' in t or t in ('qty', 'hours'):
+                    qc = ci
+                elif t == 'rate' or (t.startswith('rate') and len(t) < 14):
+                    rc = ci
+
+            if tp is not None and yt is not None:
+                header_last = ri
+                this_pay_col, ytd_col, qty_col, rate_col = tp, yt, qc, rc
+                break
+
+        if this_pay_col is None or ytd_col is None:
+            for ri in range(len(rows) - 1):
+                tp = yt = qc = rc = None
+                max_c = max(len(rows[ri]), len(rows[ri + 1]))
+                for ci in range(max_c):
+                    for cand_row in (rows[ri], rows[ri + 1]):
+                        if ci >= len(cand_row):
+                            continue
+                        c = cand_row[ci]
+                        if cls._is_na(c):
+                            continue
+                        t = str(c).strip().lower()
+                        t = re.sub(r'\s+', ' ', t)
+                        if t in ('this pay',) or t.startswith('this pay'):
+                            tp = ci
+                        elif t == 'ytd':
+                            yt = ci
+                        elif 'quantity' in t or t in ('qty', 'hours'):
+                            qc = ci
+                        elif t == 'rate' or (t.startswith('rate') and len(t) < 14):
+                            rc = ci
+                if tp is not None and yt is not None:
+                    header_last = ri + 1
+                    this_pay_col, ytd_col, qty_col, rate_col = tp, yt, qc, rc
+                    break
+
+        if this_pay_col is None or ytd_col is None:
+            for ri, row in enumerate(rows):
+                joined = ' '.join(str(c).lower() for c in row if c is not None)
+                if 'earnings' not in joined or 'quantity' not in joined:
+                    continue
+                tp_c = yt_c = qc_c = rc_c = None
+                for ci, c in enumerate(row):
+                    if cls._is_na(c):
+                        continue
+                    t = str(c).strip().lower()
+                    t = re.sub(r'\s+', ' ', t)
+                    if t in ('this pay',) or t.startswith('this pay'):
+                        tp_c = ci
+                    elif t == 'ytd':
+                        yt_c = ci
+                    elif 'quantity' in t or t in ('qty', 'hours'):
+                        qc_c = ci
+                    elif t == 'rate' or (t.startswith('rate') and len(t) < 14):
+                        rc_c = ci
+                if tp_c is not None and yt_c is not None:
+                    header_last = ri
+                    this_pay_col, ytd_col, qty_col, rate_col = tp_c, yt_c, qc_c, rc_c
+                    break
+                if len(row) >= 5:
+                    header_last = ri
+                    this_pay_col = 3
+                    ytd_col = 4
+                    break
+
+        if header_last is None:
+            return None, None, None, None, None, None
+
+        data_start = header_last + 1
+        while data_start < len(rows):
+            r = rows[data_start]
+            joined = ' '.join(str(c).strip().lower() for c in r if not cls._is_na(c))
+            if joined and all(
+                x in joined
+                for x in ('this pay', 'ytd')
+            ):
+                data_start += 1
+                continue
+            if joined == 'quantity rate this pay ytd' or joined.startswith('quantity '):
+                data_start += 1
+                continue
+            break
+
+        return header_last, data_start, this_pay_col, ytd_col, qty_col, rate_col
+
+    @classmethod
+    def _looks_like_person_name(cls, line):
+        line = line.strip()
+        if len(line) < 3 or len(line) > 70:
+            return False
+        low = line.lower()
+        if any(sk in low for sk in cls._SKIP_NAME_SUB):
+            return False
+        if ':' in line and len(line) < 55:
+            return False
+        if re.search(r'\d{4,}', line):
+            return False
+        if re.match(r'^[\d\s$,.%-]+$', line):
+            return False
+        # Latin letters + Māori diacritics + 中文
+        return bool(
+            re.match(
+                r"^[\s'A-Za-z\u0080-\u024f\u4e00-\u9fff]"
+                r"[\s'A-Za-z\u0080-\u024f\u4e00-\u9fff.\-]{2,}$",
+                line,
+            )
+        )
+
+    @classmethod
     def _guess_name(cls, rows, pay_row_idx):
-        limit = min(pay_row_idx, 22)
-        for ri in range(limit):
+        """优先 Pay Period 行上方的姓名格；支持合并单元格内换行。"""
+        ordered_indices = []
+        for d in range(1, 10):
+            ri = pay_row_idx - d
+            if ri >= 0:
+                ordered_indices.append(ri)
+        for ri in range(min(pay_row_idx, 24)):
+            if ri not in ordered_indices:
+                ordered_indices.append(ri)
+
+        seen = set()
+        for ri in ordered_indices:
+            if ri in seen:
+                continue
+            seen.add(ri)
             for c in rows[ri]:
                 if cls._is_na(c):
                     continue
-                s = str(c).strip()
-                if len(s) < 3 or len(s) > 70:
-                    continue
-                low = s.lower()
-                if any(sk in low for sk in cls._SKIP_NAME_SUB):
-                    continue
-                if ':' in s and len(s) < 55:
-                    continue
-                if re.search(r'\d{4,}', s):
-                    continue
-                if re.match(r'^[\d\s$,.%-]+$', s):
-                    continue
-                if re.match(
-                    r"^[A-Za-z\u4e00-\u9fff]"
-                    r"[A-Za-z\s\-.'\u4e00-\u9fff]{2,}$",
-                    s,
-                ):
-                    return s
+                raw = str(c).replace('\r', '\n')
+                for line in raw.split('\n'):
+                    line = line.strip()
+                    if cls._looks_like_person_name(line):
+                        return line
         return None
 
     @classmethod
@@ -539,10 +663,10 @@ class ExcelPayslipImporter:
         pay_period = None
         payment_date = None
 
-        m = re.search(r'EMPLOYMENT DETAILS\s*\n?\s*([^\n]+)', blob)
+        m = re.search(r'EMPLOYMENT DETAILS\s*\n?\s*([^\n]{1,120})', blob)
         if m:
             raw = m.group(1).strip()
-            if 'pay frequency' not in raw.lower():
+            if 'pay frequency' not in raw.lower() and len(raw) < 90:
                 name = raw
 
         if not name:
@@ -597,50 +721,36 @@ class ExcelPayslipImporter:
         }
 
     @classmethod
-    def _parse_earnings_rows(cls, rows, hdr_idx):
-        header = rows[hdr_idx]
-        this_pay_col = None
-        ytd_col = None
-        qty_col = None
-        rate_col = None
-
-        for ci, c in enumerate(header):
-            if cls._is_na(c):
+    def _first_label_cell(cls, row, max_col):
+        """收入项目名称可能在 A 列或 B 列（左侧有空列）。"""
+        for ci in range(min(max_col + 1, len(row))):
+            if cls._is_na(row[ci]):
                 continue
-            cs = str(c).lower().strip()
-            if cs == 'this pay' or cs.startswith('this pay'):
-                this_pay_col = ci
-            elif cs == 'ytd':
-                ytd_col = ci
-            elif 'quantity' in cs:
-                qty_col = ci
-            elif cs == 'rate' or (cs.startswith('rate') and len(cs) < 12):
-                rate_col = ci
+            s = str(row[ci]).strip()
+            if not s:
+                continue
+            if re.match(r'^[\d$,.%\s-]+$', s) and len(s) < 18:
+                continue
+            return s
+        return ''
 
-        if this_pay_col is None and len(header) >= 5:
-            this_pay_col = 3
-
+    @classmethod
+    def _parse_earnings_rows(cls, rows, data_start, this_pay_col, ytd_col, qty_col, rate_col):
         earnings = []
-        for ri in range(hdr_idx + 1, len(rows)):
+        if this_pay_col is None:
+            return earnings
+
+        for ri in range(data_start, len(rows)):
             row = rows[ri]
             if not row:
                 continue
 
-            label = row[0]
-            if cls._is_na(label) or str(label).strip() == '':
-                for c in row[1:6]:
-                    if cls._is_na(c):
-                        continue
-                    s = str(c).strip()
-                    if s and not re.match(r'^[\d$,. -]+$', s):
-                        label = c
-                        break
-            if cls._is_na(label):
-                continue
-
-            ls = str(label).strip()
+            lim = this_pay_col + 1 if this_pay_col is not None else 6
+            ls = cls._first_label_cell(row, max(this_pay_col - 1, 5))
             ul = ls.upper()
 
+            if not ls:
+                continue
             if ul == 'TAX' or ul == 'LEAVE':
                 break
             if ul.startswith('DEDUCTION'):
@@ -662,7 +772,7 @@ class ExcelPayslipImporter:
             )
             amt = (
                 cls._float_cell(row[this_pay_col])
-                if this_pay_col is not None and len(row) > this_pay_col
+                if len(row) > this_pay_col
                 else 0.0
             )
 
@@ -691,7 +801,11 @@ class ExcelPayslipImporter:
         if pay_idx is None:
             return None, "未找到包含 Pay Period 的汇总行"
 
-        hdr_idx = cls._find_earnings_header_row(rows)
+        hdr_last, data_start, tp_col, ytd_col, qty_col, rate_col = cls._find_earnings_columns(
+            rows
+        )
+
+        hdr_idx = hdr_last
         blob_end = hdr_idx if hdr_idx is not None else min(pay_idx + 8, len(rows))
         blob = cls._rows_to_blob(rows, blob_end)
 
@@ -699,7 +813,7 @@ class ExcelPayslipImporter:
         name = cls._guess_name(rows, pay_idx)
         if not name:
             cand = meta.get('name')
-            if cand and 'pay frequency' not in cand.lower():
+            if cand and 'pay frequency' not in cand.lower() and len(cand) < 90:
                 name = cand.strip()
 
         pay_period = meta.get('pay_period') or ''
@@ -708,8 +822,22 @@ class ExcelPayslipImporter:
         net_pay = meta.get('net_pay') or 0.0
 
         earnings = []
-        if hdr_idx is not None:
-            earnings = cls._parse_earnings_rows(rows, hdr_idx)
+        if data_start is not None and tp_col is not None:
+            earnings = cls._parse_earnings_rows(
+                rows, data_start, tp_col, ytd_col, qty_col, rate_col
+            )
+
+        if not earnings:
+            full_text = cls._rows_to_blob(rows, len(rows))
+            alt, _err = PDFPayrollParser.parse_text(full_text)
+            if alt and alt.get('earnings'):
+                earnings = alt['earnings']
+                if not name and alt.get('name'):
+                    name = alt['name']
+                if total_earnings == 0 and alt.get('total_earnings'):
+                    total_earnings = alt['total_earnings']
+                if net_pay == 0 and alt.get('net_pay'):
+                    net_pay = alt['net_pay']
 
         sum_lines = sum(e['amount'] for e in earnings)
         if total_earnings == 0 and sum_lines > 0:
