@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.3 (PDF dual-engine extraction)
+Version: 1.4 (Excel multi-sheet payslip import)
 """
 
 import sys
@@ -432,10 +432,338 @@ class ExcelHoursImporter:
         except Exception as e:
             return None, str(e)
 
+
+class ExcelPayslipImporter:
+    """
+    Xero 等导出的「每人一页」Excel：工作簿中多个工作表，版式与 PDF 工资单类似。
+    """
+
+    _SKIP_NAME_SUB = (
+        'employment', 'pay frequency', 'ird', 'tax code', 'tax period',
+        'details', 'weekly', 'fortnightly', 'monthly', 'number',
+        'pay period', 'payment date', 'total earnings', 'net pay',
+    )
+
+    @staticmethod
+    def _is_na(v):
+        return v is None or (isinstance(v, float) and pd.isna(v))
+
+    @staticmethod
+    def _float_cell(v):
+        if ExcelPayslipImporter._is_na(v):
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip().replace(',', '').replace('$', '')
+        if not s:
+            return 0.0
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+
+    @staticmethod
+    def _normalize_rows(rows):
+        if not rows:
+            return []
+        max_c = max((len(r) for r in rows), default=0)
+        out = []
+        for r in rows:
+            r = list(r)
+            if len(r) < max_c:
+                r.extend([None] * (max_c - len(r)))
+            out.append(r)
+        return out
+
+    @staticmethod
+    def _rows_to_blob(rows, end_row):
+        lines = []
+        for r in rows[:max(0, end_row)]:
+            parts = [
+                str(c).strip()
+                for c in r
+                if not ExcelPayslipImporter._is_na(c) and str(c).strip()
+            ]
+            if parts:
+                lines.append(' '.join(parts))
+        return '\n'.join(lines)
+
+    @staticmethod
+    def _find_pay_period_row(rows):
+        for ri, row in enumerate(rows):
+            for c in row:
+                if c is not None and 'pay period' in str(c).lower():
+                    return ri
+        return None
+
+    @staticmethod
+    def _find_earnings_header_row(rows):
+        for ri, row in enumerate(rows):
+            joined = ' '.join(str(c).lower() for c in row if c is not None)
+            if 'earnings' in joined and 'quantity' in joined:
+                if 'this pay' in joined or 'rate' in joined:
+                    return ri
+        return None
+
+    @classmethod
+    def _guess_name(cls, rows, pay_row_idx):
+        limit = min(pay_row_idx, 22)
+        for ri in range(limit):
+            for c in rows[ri]:
+                if cls._is_na(c):
+                    continue
+                s = str(c).strip()
+                if len(s) < 3 or len(s) > 70:
+                    continue
+                low = s.lower()
+                if any(sk in low for sk in cls._SKIP_NAME_SUB):
+                    continue
+                if ':' in s and len(s) < 55:
+                    continue
+                if re.search(r'\d{4,}', s):
+                    continue
+                if re.match(r'^[\d\s$,.%-]+$', s):
+                    continue
+                if re.match(
+                    r"^[A-Za-z\u4e00-\u9fff]"
+                    r"[A-Za-z\s\-.'\u4e00-\u9fff]{2,}$",
+                    s,
+                ):
+                    return s
+        return None
+
+    @classmethod
+    def _parse_meta_blob(cls, blob):
+        """汇总区的 Pay Period / Total / Net 与 PDF 规则对齐。"""
+        name = None
+        pay_period = None
+        payment_date = None
+
+        m = re.search(r'EMPLOYMENT DETAILS\s*\n?\s*([^\n]+)', blob)
+        if m:
+            raw = m.group(1).strip()
+            if 'pay frequency' not in raw.lower():
+                name = raw
+
+        if not name:
+            for pattern in (
+                r'Employee\s*Name\s*[:\s]+\s*([^\n]+)',
+                r'(?:Full\s*Name|Staff\s*Name)\s*[:\s]+\s*([^\n]+)',
+                r'EMPLOYEE\s*[:\s]+\s*([^\n]+)',
+            ):
+                m = re.search(pattern, blob, re.I)
+                if m:
+                    name = m.group(1).strip()
+                    break
+
+        m = re.search(r'Pay Period:\s*([\d\s\w\-–]+)', blob)
+        if m:
+            pay_period = m.group(1).strip()
+
+        m = re.search(r'Payment Date:\s*([\d\s\w\-–]+)', blob)
+        if m:
+            payment_date = m.group(1).strip()
+
+        money_num = r'([\d,]+(?:\.\d{1,2})?)'
+
+        def scan_money(patterns):
+            for pat in patterns:
+                m = re.search(pat, blob, re.I | re.MULTILINE)
+                if m:
+                    try:
+                        return float(m.group(1).replace(',', ''))
+                    except ValueError:
+                        continue
+            return 0.0
+
+        total_earnings = scan_money([
+            rf'Total\s+Earnings:\s*\$?{money_num}',
+            rf'Gross\s+(?:Pay|Earnings|Income):\s*\$?{money_num}',
+            rf'Total\s+Gross:\s*\$?{money_num}',
+            rf'Earnings\s+Total:\s*\$?{money_num}',
+        ])
+        net_pay = scan_money([
+            rf'Net\s+Pay:\s*\$?{money_num}',
+            rf'(?:Take\s*Home|Take-home|Net\s+Amount|Amount\s+Payable):\s*\$?{money_num}',
+            rf'Pay\s+into\s+bank:\s*\$?{money_num}',
+        ])
+
+        return {
+            'name': name,
+            'pay_period': pay_period,
+            'payment_date': payment_date,
+            'total_earnings': total_earnings,
+            'net_pay': net_pay,
+        }
+
+    @classmethod
+    def _parse_earnings_rows(cls, rows, hdr_idx):
+        header = rows[hdr_idx]
+        this_pay_col = None
+        ytd_col = None
+        qty_col = None
+        rate_col = None
+
+        for ci, c in enumerate(header):
+            if cls._is_na(c):
+                continue
+            cs = str(c).lower().strip()
+            if cs == 'this pay' or cs.startswith('this pay'):
+                this_pay_col = ci
+            elif cs == 'ytd':
+                ytd_col = ci
+            elif 'quantity' in cs:
+                qty_col = ci
+            elif cs == 'rate' or (cs.startswith('rate') and len(cs) < 12):
+                rate_col = ci
+
+        if this_pay_col is None and len(header) >= 5:
+            this_pay_col = 3
+
+        earnings = []
+        for ri in range(hdr_idx + 1, len(rows)):
+            row = rows[ri]
+            if not row:
+                continue
+
+            label = row[0]
+            if cls._is_na(label) or str(label).strip() == '':
+                for c in row[1:6]:
+                    if cls._is_na(c):
+                        continue
+                    s = str(c).strip()
+                    if s and not re.match(r'^[\d$,. -]+$', s):
+                        label = c
+                        break
+            if cls._is_na(label):
+                continue
+
+            ls = str(label).strip()
+            ul = ls.upper()
+
+            if ul == 'TAX' or ul == 'LEAVE':
+                break
+            if ul.startswith('DEDUCTION'):
+                break
+            if ul == 'EARNINGS':
+                continue
+            if ul == 'TOTAL' or ls.lower() == 'total':
+                break
+
+            qty = (
+                cls._float_cell(row[qty_col])
+                if qty_col is not None and len(row) > qty_col
+                else 0.0
+            )
+            rate = (
+                cls._float_cell(row[rate_col])
+                if rate_col is not None and len(row) > rate_col
+                else 0.0
+            )
+            amt = (
+                cls._float_cell(row[this_pay_col])
+                if this_pay_col is not None and len(row) > this_pay_col
+                else 0.0
+            )
+
+            if abs(amt) < 1e-9 and ytd_col is not None and len(row) > ytd_col:
+                amt = cls._float_cell(row[ytd_col])
+
+            if abs(amt) < 1e-9:
+                continue
+
+            earnings.append({
+                'name': ls,
+                'quantity': qty,
+                'rate': rate,
+                'amount': amt,
+            })
+
+        return earnings
+
+    @classmethod
+    def parse_sheet(cls, rows, sheet_label=''):
+        rows = cls._normalize_rows(rows)
+        if not rows:
+            return None, "空表"
+
+        pay_idx = cls._find_pay_period_row(rows)
+        if pay_idx is None:
+            return None, "未找到包含 Pay Period 的汇总行"
+
+        hdr_idx = cls._find_earnings_header_row(rows)
+        blob_end = hdr_idx if hdr_idx is not None else min(pay_idx + 8, len(rows))
+        blob = cls._rows_to_blob(rows, blob_end)
+
+        meta = cls._parse_meta_blob(blob)
+        name = cls._guess_name(rows, pay_idx)
+        if not name:
+            cand = meta.get('name')
+            if cand and 'pay frequency' not in cand.lower():
+                name = cand.strip()
+
+        pay_period = meta.get('pay_period') or ''
+        payment_date = meta.get('payment_date') or ''
+        total_earnings = meta.get('total_earnings') or 0.0
+        net_pay = meta.get('net_pay') or 0.0
+
+        earnings = []
+        if hdr_idx is not None:
+            earnings = cls._parse_earnings_rows(rows, hdr_idx)
+
+        sum_lines = sum(e['amount'] for e in earnings)
+        if total_earnings == 0 and sum_lines > 0:
+            total_earnings = sum_lines
+
+        result = {
+            'name': name,
+            'pay_period': pay_period,
+            'payment_date': payment_date,
+            'total_earnings': total_earnings,
+            'net_pay': net_pay,
+            'earnings': earnings,
+        }
+
+        if (
+            not name
+            and not earnings
+            and total_earnings == 0
+            and net_pay == 0
+        ):
+            return None, "未能解析姓名或收入（版式是否与 Xero 导出一致？）"
+
+        return result, None
+
+    @staticmethod
+    def import_workbook(filepath):
+        results = []
+        errors = []
+        try:
+            xl = pd.ExcelFile(filepath)
+        except Exception as e:
+            return [], [str(e)]
+
+        for sheet_name in xl.sheet_names:
+            try:
+                df = pd.read_excel(filepath, sheet_name=sheet_name, header=None)
+                rows = []
+                for _, row in df.iterrows():
+                    rows.append([None if pd.isna(v) else v for v in row])
+                data, err = ExcelPayslipImporter.parse_sheet(rows, sheet_name)
+                if err:
+                    errors.append(f"{sheet_name}: {err}")
+                elif data:
+                    results.append(data)
+            except Exception as e:
+                errors.append(f"{sheet_name}: {e}")
+
+        return results, errors
+
+
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.3")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
@@ -466,6 +794,11 @@ class PayrollAnalyzer(QMainWindow):
         import_pdf_action.setShortcut('Ctrl+P')
         import_pdf_action.triggered.connect(self.import_pdf)
         file_menu.addAction(import_pdf_action)
+
+        import_xlsx_payslip_action = QAction('导入Excel工资簿(&X)', self)
+        import_xlsx_payslip_action.setShortcut('Ctrl+Shift+X')
+        import_xlsx_payslip_action.triggered.connect(self.import_excel_payslips)
+        file_menu.addAction(import_xlsx_payslip_action)
 
         import_excel_action = QAction('导入Excel工时表(&E)', self)
         import_excel_action.setShortcut('Ctrl+E')
@@ -507,6 +840,12 @@ class PayrollAnalyzer(QMainWindow):
         btn_pdf.clicked.connect(self.import_pdf)
         toolbar.addWidget(btn_pdf)
 
+        btn_xlsx_slips = QPushButton("📑 导入Excel工资簿")
+        btn_xlsx_slips.setStyleSheet("padding: 8px 16px; font-size: 12px;")
+        btn_xlsx_slips.setToolTip("每人一个工作表，如 Table 1 / Table 2 …")
+        btn_xlsx_slips.clicked.connect(self.import_excel_payslips)
+        toolbar.addWidget(btn_xlsx_slips)
+
         btn_excel = QPushButton("📊 导入Excel工时")
         btn_excel.setStyleSheet("padding: 8px 16px; font-size: 12px;")
         btn_excel.clicked.connect(self.import_excel)
@@ -539,7 +878,7 @@ class PayrollAnalyzer(QMainWindow):
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage("就绪 | 请导入PDF工资单或Excel工时表")
+        self.status.showMessage("就绪 | PDF / Excel工资簿工资单 / Excel工时表")
 
     def create_summary_tab(self):
         widget = QWidget()
@@ -758,6 +1097,47 @@ class PayrollAnalyzer(QMainWindow):
             return
 
         self.current_week = week_id
+        self._commit_payslip_week(all_data, week_id)
+
+    def import_excel_payslips(self):
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择Excel工资簿（每位员工一个工作表）",
+            "",
+            "Excel Files (*.xlsx *.xls)",
+        )
+        if not filepath:
+            return
+
+        all_data, errors = ExcelPayslipImporter.import_workbook(filepath)
+        if errors:
+            msg = "\n".join(errors[:40])
+            if len(errors) > 40:
+                msg += f"\n… 其余 {len(errors) - 40} 条略"
+            QMessageBox.warning(self, "部分工作表未导入", msg)
+
+        if not all_data:
+            QMessageBox.warning(self, "导入失败", "未能从任何工作表解析出工资单")
+            return
+
+        preview = "解析成功:\n"
+        for d in all_data:
+            nm = d.get('name') or '(未识别姓名)'
+            preview += f"  {nm}: ${d.get('total_earnings', 0):.2f} ({len(d.get('earnings', []))}项收入)\n"
+
+        week_id, ok = QInputDialog.getText(
+            self,
+            "设置周ID",
+            f"{preview}\n请输入周标识 (如: 2026-W18):",
+            text=self.guess_week_id(all_data[0]),
+        )
+        if not ok or not week_id:
+            return
+
+        self.current_week = week_id
+        self._commit_payslip_week(all_data, week_id)
+
+    def _commit_payslip_week(self, all_data, week_id):
         if week_id not in self.db.history:
             self.db.history[week_id] = {}
 
@@ -779,7 +1159,6 @@ class PayrollAnalyzer(QMainWindow):
                 'raw_earnings': data.get('earnings', [])
             }
 
-            # 自动分类
             categorized = {'labor_cost': 0, 'benefits': 0, 'performance': 0,
                           'fixed_salary': 0, 'other': 0}
 
