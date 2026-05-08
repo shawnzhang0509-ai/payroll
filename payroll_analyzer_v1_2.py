@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.2 (week-ID dialog: QTextEdit scroll only)
+Version: 1.4.3 (week-ID preview: plain text + truncation + safe commit)
 """
 
 import sys
@@ -15,12 +15,14 @@ from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
 
+import traceback
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTableWidget, QTableWidgetItem, QComboBox,
     QFileDialog, QMessageBox, QTabWidget, QHeaderView,
     QDialog, QLineEdit, QDialogButtonBox,
-    QTextEdit,
+    QPlainTextEdit,
     QStatusBar, QMenuBar, QMenu,
     QListWidget, QListWidgetItem, QInputDialog
 )
@@ -892,7 +894,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.2")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.3")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
@@ -1215,10 +1217,17 @@ class PayrollAnalyzer(QMainWindow):
             QMessageBox.warning(self, "导入失败", "无法解析任何PDF文件")
             return
 
-        # 显示解析结果预览
-        preview = "解析成功:\n"
-        for d in all_data:
-            preview += f"  {d['name']}: ${d['total_earnings']:.2f} ({len(d['earnings'])}项收入)\n"
+        # 显示解析结果预览（人多时勿拼接数万行再截断，避免卡顿）
+        if len(all_data) > 350:
+            preview = "解析成功:\n"
+            preview += f"（共 {len(all_data)} 条；下方仅列出前 35 条，其余略 — 不影响导入）\n\n"
+            for d in all_data[:35]:
+                preview += f"  {d['name']}: ${d['total_earnings']:.2f} ({len(d['earnings'])}项收入)\n"
+            preview += f"\n… 省略 {len(all_data) - 35} 条。\n"
+        else:
+            preview = "解析成功:\n"
+            for d in all_data:
+                preview += f"  {d['name']}: ${d['total_earnings']:.2f} ({len(d['earnings'])}项收入)\n"
 
         week_id, ok = self._prompt_week_id(
             preview, self.guess_week_id(all_data[0])
@@ -1227,7 +1236,16 @@ class PayrollAnalyzer(QMainWindow):
             return
 
         self.current_week = week_id
-        self._commit_payslip_week(all_data, week_id)
+        try:
+            self._commit_payslip_week(all_data, week_id)
+        except Exception as e:
+            mb = QMessageBox(self)
+            mb.setIcon(QMessageBox.Icon.Critical)
+            mb.setWindowTitle("导入失败")
+            mb.setText(str(e))
+            mb.setDetailedText(traceback.format_exc())
+            mb.exec()
+            traceback.print_exc()
 
     def import_excel_payslips(self):
         filepath, _ = QFileDialog.getOpenFileName(
@@ -1250,10 +1268,24 @@ class PayrollAnalyzer(QMainWindow):
             QMessageBox.warning(self, "导入失败", "未能从任何工作表解析出工资单")
             return
 
-        preview = "解析成功:\n"
-        for d in all_data:
-            nm = d.get('name') or '(未识别姓名)'
-            preview += f"  {nm}: ${d.get('total_earnings', 0):.2f} ({len(d.get('earnings', []))}项收入)\n"
+        if len(all_data) > 350:
+            preview = "解析成功:\n"
+            preview += f"（共 {len(all_data)} 条；下方仅列出前 35 条，其余略 — 不影响导入）\n\n"
+            for d in all_data[:35]:
+                nm = d.get('name') or '(未识别姓名)'
+                preview += (
+                    f"  {nm}: ${d.get('total_earnings', 0):.2f} "
+                    f"({len(d.get('earnings', []))}项收入)\n"
+                )
+            preview += f"\n… 省略 {len(all_data) - 35} 条。\n"
+        else:
+            preview = "解析成功:\n"
+            for d in all_data:
+                nm = d.get('name') or '(未识别姓名)'
+                preview += (
+                    f"  {nm}: ${d.get('total_earnings', 0):.2f} "
+                    f"({len(d.get('earnings', []))}项收入)\n"
+                )
 
         week_id, ok = self._prompt_week_id(
             preview, self.guess_week_id(all_data[0])
@@ -1262,7 +1294,16 @@ class PayrollAnalyzer(QMainWindow):
             return
 
         self.current_week = week_id
-        self._commit_payslip_week(all_data, week_id)
+        try:
+            self._commit_payslip_week(all_data, week_id)
+        except Exception as e:
+            mb = QMessageBox(self)
+            mb.setIcon(QMessageBox.Icon.Critical)
+            mb.setWindowTitle("导入失败")
+            mb.setText(str(e))
+            mb.setDetailedText(traceback.format_exc())
+            mb.exec()
+            traceback.print_exc()
 
     def _commit_payslip_week(self, all_data, week_id):
         if week_id not in self.db.history:
@@ -1340,24 +1381,61 @@ class PayrollAnalyzer(QMainWindow):
         self.status.showMessage(f"导入 {len(data)} 条工时记录，更新 {updated} 条工资单工时")
         self.refresh_all()
 
+    @staticmethod
+    def _clip_preview_text(text: str, max_lines: int = 500, max_chars: int = 180_000) -> str:
+        """超长预览会拖垮文本控件；截断只影响弹窗显示，不影响导入数据。"""
+        text = text.replace('\x00', '')
+        raw_lines = text.splitlines()
+        n = len(raw_lines)
+        if n > max_lines:
+            head_n = max_lines // 2
+            tail_n = max_lines - head_n - 2
+            tail_n = max(1, tail_n)
+            if head_n + tail_n > n:
+                head_n = n // 2
+                tail_n = n - head_n
+            omitted = max(0, n - head_n - tail_n)
+            lines = (
+                [f"【共 {n} 行，预览仅显示前 {head_n} 行与后 {tail_n} 行（导入不受影响）】", ""]
+                + raw_lines[:head_n]
+                + [f"…… 省略约 {omitted} 行 ……"]
+                + raw_lines[-tail_n:]
+            )
+            text = '\n'.join(lines)
+        if len(text) > max_chars:
+            keep = max(4000, max_chars // 2 - 120)
+            text = (
+                "【预览过长已截断字符（导入不受影响）】\n\n"
+                + text[:keep]
+                + "\n\n…… 中间省略 ……\n\n"
+                + text[-keep:]
+            )
+        return text
+
     def _prompt_week_id(self, preview_text: str, default_week: str):
         """
-        自定义对话框：预览区可滚动。
-
-        注意：不要用 QScrollArea 包裹 QTextEdit 且 setWidgetResizable(True)，否则 QTextEdit
-        会为撑满全文无限增高，超长列表时易崩溃；QTextEdit 自带滚动条，限制高度即可。
+        使用 QPlainTextEdit（大段纯文本比 QTextEdit 更省内存）；预览过长时截断。
         """
+        safe = self._clip_preview_text(preview_text)
         dlg = QDialog(self)
         dlg.setWindowTitle("设置周ID")
         dlg.setMinimumWidth(560)
-        layout = QVBoxLayout(dlg)
+        dlg.resize(660, 520)
 
-        layout.addWidget(QLabel("解析预览（可滚动）:"))
-        viewer = QTextEdit()
+        layout = QVBoxLayout(dlg)
+        tip = QLabel(
+            "解析预览（纯文本；人数很多时会自动截断预览，不影响实际导入）。"
+        )
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+
+        viewer = QPlainTextEdit()
         viewer.setReadOnly(True)
-        viewer.setPlainText(preview_text.rstrip())
-        viewer.setMinimumHeight(300)
-        viewer.setMaximumHeight(460)
+        viewer.setUndoRedoEnabled(False)
+        viewer.setPlainText(safe)
+        viewer.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        viewer.setMinimumHeight(260)
+        viewer.setMaximumHeight(400)
         layout.addWidget(viewer)
 
         layout.addWidget(QLabel("请输入周标识（例如 2026-W18）："))
