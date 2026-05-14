@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.6 (atomic JSON save + permission hints)
+Version: 1.4.7 (Excel payslip grid meta + totals inference)
 """
 
 import copy
@@ -835,14 +835,18 @@ class ExcelPayslipImporter:
         money_num = r'([\d,]+(?:\.\d{1,2})?)'
 
         def scan_money(patterns):
+            """Many PDF→Excel exports repeat labels; skip leading $0.00 and take first non-zero."""
+            found: list[float] = []
             for pat in patterns:
-                m = re.search(pat, blob, re.I | re.MULTILINE)
-                if m:
+                for m in re.finditer(pat, blob, re.I | re.MULTILINE):
                     try:
-                        return float(m.group(1).replace(',', ''))
-                    except ValueError:
+                        found.append(float(m.group(1).replace(',', '')))
+                    except (ValueError, IndexError):
                         continue
-            return 0.0
+            for v in found:
+                if abs(v) > 1e-9:
+                    return v
+            return found[-1] if found else 0.0
 
         total_earnings = scan_money([
             rf'Total\s+Earnings:\s*\$?{money_num}',
@@ -936,6 +940,67 @@ class ExcelPayslipImporter:
         return earnings
 
     @classmethod
+    def _earnings_block_total(cls, rows, data_start, tp_col, ytd_col):
+        """
+        Xero 表单式导出：汇总行 Total Earnings 常为 $0，但 EARNINGS 块末行 TOTAL 的
+        THIS PAY / YTD 列才是可信合计。
+        """
+        if data_start is None or tp_col is None or ytd_col is None:
+            return None, None
+        for ri in range(data_start, len(rows)):
+            row = rows[ri]
+            if not row:
+                continue
+            lab = cls._first_label_cell(row, max(tp_col, ytd_col, 5))
+            ul = (lab or '').strip().upper()
+            if ul == 'TAX' or ul == 'LEAVE':
+                break
+            if ul == 'TOTAL':
+                tp = cls._float_cell(row[tp_col]) if len(row) > tp_col else 0.0
+                yt = cls._float_cell(row[ytd_col]) if len(row) > ytd_col else 0.0
+                return tp, yt
+        return None, None
+
+    @classmethod
+    def _find_paye_this_period(cls, rows, tp_col):
+        if tp_col is None:
+            return None
+        for row in rows:
+            if not row:
+                continue
+            lab = cls._first_label_cell(row, max(tp_col + 1, 6))
+            if not lab or 'paye' not in lab.lower():
+                continue
+            if len(row) > tp_col:
+                v = cls._float_cell(row[tp_col])
+                if v > 1e-6:
+                    return v
+        return None
+
+    @classmethod
+    def _infer_net_pay(cls, rows, total_earnings, tp_col):
+        """Bank 入账金额优先；否则 Total − PAYE(this)；再否则用 Total（残缺导出）。"""
+        if total_earnings < 1e-6:
+            return None
+        for row in rows:
+            if not row:
+                continue
+            joined = ' '.join(str(c) for c in row if not cls._is_na(c))
+            if not re.search(r'\d{2}-\d{4}-\d+-\d+', joined):
+                continue
+            best = 0.0
+            for c in row:
+                v = cls._float_cell(c)
+                if v > best:
+                    best = v
+            if best > 1e-3:
+                return best
+        paye = cls._find_paye_this_period(rows, tp_col)
+        if paye is not None and paye > 1e-6 and total_earnings > paye + 1e-3:
+            return total_earnings - paye
+        return total_earnings
+
+    @classmethod
     def parse_sheet(cls, rows, sheet_label=''):
         rows = cls._normalize_rows(rows)
         if not rows:
@@ -983,9 +1048,26 @@ class ExcelPayslipImporter:
                 if net_pay == 0 and alt.get('net_pay'):
                     net_pay = alt['net_pay']
 
+        tp_tot, ytd_tot = cls._earnings_block_total(rows, data_start, tp_col, ytd_col)
+        if total_earnings < 1e-6:
+            if tp_tot is not None and tp_tot > 1e-6:
+                total_earnings = tp_tot
+            elif ytd_tot is not None and ytd_tot > 1e-6:
+                total_earnings = ytd_tot
+
         sum_lines = sum(e['amount'] for e in earnings)
-        if total_earnings == 0 and sum_lines > 0:
+        if total_earnings < 1e-6 and sum_lines > 0:
             total_earnings = sum_lines
+
+        if net_pay < 1e-6:
+            full_blob = cls._rows_to_blob(rows, len(rows))
+            meta2 = cls._parse_meta_blob(full_blob)
+            if abs(float(meta2.get('net_pay') or 0)) > 1e-9:
+                net_pay = float(meta2['net_pay'])
+            if net_pay < 1e-6:
+                guessed = cls._infer_net_pay(rows, total_earnings, tp_col)
+                if guessed is not None and guessed > 1e-6:
+                    net_pay = guessed
 
         result = {
             'name': name,
@@ -1035,7 +1117,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.6")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.7")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
