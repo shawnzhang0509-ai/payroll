@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 PDF → Excel 小工具：每页一个工作表。
-默认 auto：尝试表格，但若识别结果明显“比整页文字短很多”（常见工资单无框线），
-则改用版式文本行，避免只剩两三行 TOTAL。
+默认按页导出网格（--sheet-format grid）。工资单可改用 --sheet-format payslip（Table 1…，多列表头）。
 依赖: pip install pdfplumber pandas openpyxl
 可选: pip install pymupdf  （仅作无 pdfplumber 时的文字回退）
 
@@ -236,6 +235,9 @@ def _page_rows_pdfplumber(page, mode: str) -> list[list[str]]:
             return text_rows
 
     return table_rows
+
+
+def _page_text_fallback_pymupdf(doc: "fitz.Document", page_index: int) -> list[list[str]]:
     page = doc.load_page(page_index)
     t = page.get_text("text") or ""
     lines = t.splitlines()
@@ -244,14 +246,444 @@ def _page_rows_pdfplumber(page, mode: str) -> list[list[str]]:
     return [[ln] for ln in lines]
 
 
+PAYSLIP_COLS = 10
+
+
+def _pad_row(cells: list) -> list[str]:
+    r = ["" if c is None else str(c) for c in cells]
+    if len(r) >= PAYSLIP_COLS:
+        return r[:PAYSLIP_COLS]
+    return r + [""] * (PAYSLIP_COLS - len(r))
+
+
+def _fmt_money(v) -> str:
+    if v is None:
+        return ""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return f"{x:,.2f}"
+
+
+def _fmt_qty(v) -> str:
+    if v is None:
+        return ""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    s = f"{x:.6f}".rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def _extract_page_plain_text(pdf_path: Path, page_index: int) -> str:
+    chunks: list[str] = []
+    if pdfplumber is not None:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            pg = pdf.pages[page_index]
+            t = None
+            try:
+                t = pg.extract_text(layout=True, x_tolerance=2, y_tolerance=2)
+            except TypeError:
+                t = pg.extract_text(layout=True)
+            if not t:
+                try:
+                    t = pg.extract_text(x_tolerance=2, y_tolerance=2)
+                except TypeError:
+                    t = pg.extract_text()
+            if not t:
+                t = pg.extract_text(layout=True) or pg.extract_text() or ""
+            chunks.append(t)
+    if fitz is not None:
+        doc = fitz.open(str(pdf_path))
+        try:
+            chunks.append(doc[page_index].get_text("text") or "")
+        finally:
+            doc.close()
+    if not chunks:
+        return ""
+    return max(chunks, key=lambda s: len((s or "").strip()))
+
+
+def _looks_like_person_line(s: str) -> bool:
+    s = (s or "").strip()
+    if len(s) < 4 or len(s) > 80:
+        return False
+    if re.search(r"\d{2}-\d{4}-\d+", s):
+        return False
+    if any(k in s.lower() for k in ("pay period", "payment date", "earnings", "employment", "weekly", "fortnight")):
+        return False
+    parts = s.split()
+    if len(parts) < 2:
+        return False
+    letters = sum(ch.isalpha() for ch in s)
+    return letters >= max(6, len(s) // 3)
+
+
+def _guess_name_address(lines: list[str]) -> tuple[str | None, list[str]]:
+    name = None
+    addr: list[str] = []
+    i0 = 0
+    for i, raw in enumerate(lines[:30]):
+        if "EMPLOYMENT" in raw.upper() and "DETAIL" in raw.upper():
+            i0 = i + 1
+            break
+    for j in range(i0, min(len(lines), i0 + 18)):
+        s = lines[j].strip()
+        if not s:
+            continue
+        u = s.upper()
+        if "PAY PERIOD" in u and "PAYMENT" in u:
+            break
+        if "EARNINGS" in u and "QUANTITY" in u:
+            break
+        if name is None and _looks_like_person_line(s):
+            name = s
+            continue
+        if name and not addr and (re.search(r"\d", s) or "auckland" in s.lower() or "/" in s):
+            addr.append(s)
+            if len(addr) >= 3:
+                break
+        elif name and len(addr) == 1 and len(s) > 8:
+            addr.append(s)
+            break
+    return name, addr
+
+
+def parse_payslip_export_dict(text: str) -> dict:
+    """Parse one payslip page (Xero-style text). Keeps logic self-contained (no PyQt import)."""
+    lines = text.split("\n")
+    t = text
+
+    name = None
+    nm = re.search(r"EMPLOYMENT DETAILS\s*\n?\s*([^\n]+)", t)
+    if nm:
+        cand = nm.group(1).strip()
+        if not any(x in cand.lower() for x in ("pay frequency", "weekly", "ird", "tax code")):
+            name = cand
+
+    pay_period = None
+    m = re.search(r"Pay Period:\s*([^\n]+?)(?:\s{2,}Payment|\n)", t, re.I)
+    if not m:
+        m = re.search(r"Pay Period:\s*([\d\s\w\-–]+)", t, re.I)
+    if m:
+        pay_period = m.group(1).strip()
+
+    payment_date = None
+    m = re.search(r"Payment Date:\s*([\d\s\w]+)", t, re.I)
+    if m:
+        payment_date = m.group(1).strip()
+
+    total_earnings = None
+    m = re.search(r"Total Earnings:\s*\$?([\d,]+\.\d+)", t, re.I)
+    if m:
+        total_earnings = float(m.group(1).replace(",", ""))
+
+    net_pay = None
+    m = re.search(r"Net Pay:\s*\$?([\d,]+\.\d+)", t, re.I)
+    if m:
+        net_pay = float(m.group(1).replace(",", ""))
+
+    employment_lines: list[str] = []
+    for raw in lines[:45]:
+        s = raw.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if "employment details" in low:
+            continue
+        if s.upper().startswith("EARNINGS") and "QUANTITY" in s.upper():
+            break
+        if low.startswith("pay frequency") or "ird number" in low or "ird no" in low:
+            employment_lines.append(s)
+        elif low.startswith("tax code") or low.startswith("tax period"):
+            employment_lines.append(s)
+        if "pay period:" in low and "payment date" in low:
+            break
+
+    g_name, g_addr = _guess_name_address(lines)
+    if not name:
+        name = g_name
+    address_lines = g_addr
+
+    earnings_start = -1
+    earnings_end = -1
+    for i, line in enumerate(lines):
+        if "EARNINGS" in line and earnings_start == -1:
+            earnings_start = i
+        if earnings_start != -1 and ("TAX" in line and "PAYE" in line):
+            earnings_end = i
+            break
+        if earnings_start != -1 and line.strip().upper().startswith("TAX"):
+            earnings_end = i
+            break
+        if earnings_start != -1 and "LEAVE" in line and "Annual" in line:
+            earnings_end = i
+            break
+
+    if earnings_start == -1:
+        earnings_start = 0
+    if earnings_end == -1:
+        earnings_end = len(lines)
+
+    earnings: list[dict] = []
+    for line in lines[earnings_start:earnings_end]:
+        line = line.strip()
+        if not line or line == "EARNINGS" or line == "TOTAL":
+            continue
+        if "QUANTITY" in line and "RATE" in line:
+            continue
+        if "THIS PAY" in line and "YTD" in line:
+            continue
+
+        amounts_found = re.findall(r"\$([\d,]+(?:\.\d+)?)", line)
+        if not amounts_found:
+            amounts_found = re.findall(r"(?:^|\s)([\d,]+\.\d{2})(?=\s|$)", line)
+
+        if not amounts_found:
+            continue
+
+        if len(amounts_found) >= 2:
+            this_pay = float(amounts_found[-2].replace(",", ""))
+            ytd = float(amounts_found[-1].replace(",", ""))
+        else:
+            this_pay = float(amounts_found[-1].replace(",", ""))
+            ytd = None
+
+        item_text = line
+        for amt in amounts_found:
+            item_text = item_text.replace(f"${amt}", "")
+        item_name = re.sub(r"\s+", " ", item_text.strip())
+        item_name = re.sub(r"\d+\.\d+\s*(hours?|Hours?|hour)?", "", item_name, flags=re.I).strip()
+        item_name = re.sub(r"\s+", " ", item_name).strip()
+        if not item_name:
+            continue
+
+        quantity = None
+        rate = None
+        qty_match = re.search(r"(\d+\.\d+)\s*(hours?|Hours?)", line, re.I)
+        if qty_match:
+            quantity = float(qty_match.group(1))
+        rate_match = re.search(r"\$(\d+\.\d+)\s+\$", line)
+        if rate_match:
+            rate = float(rate_match.group(1))
+
+        earnings.append(
+            {
+                "name": item_name,
+                "quantity": quantity,
+                "rate": rate,
+                "this_pay": this_pay,
+                "ytd": ytd,
+            }
+        )
+
+    tax_rows: list[dict] = []
+    in_tax = False
+    for line in lines:
+        u = line.strip().upper()
+        if u.startswith("TAX") and "THIS" in u:
+            in_tax = True
+            continue
+        if in_tax and u.startswith("PAYMENTS"):
+            break
+        if in_tax and re.search(r"\bPAYE\b", line, re.I):
+            amts = re.findall(r"\$([\d,]+(?:\.\d+)?)", line)
+            if amts:
+                tax_rows.append(
+                    {
+                        "name": "PAYE",
+                        "this_pay": float(amts[0].replace(",", "")),
+                        "ytd": float(amts[1].replace(",", "")) if len(amts) > 1 else None,
+                    }
+                )
+
+    payments: list[dict] = []
+    in_pay = False
+    for line in lines:
+        u = line.strip().upper()
+        if u.startswith("PAYMENTS"):
+            in_pay = True
+            continue
+        if in_pay and u.startswith("LEAVE"):
+            break
+        if in_pay:
+            mba = re.search(r"(\d{2}-\d{4}-\d+-\d+)", line)
+            amts = re.findall(r"\$([\d,]+(?:\.\d+)?)", line)
+            if mba and amts:
+                payments.append({"particulars": mba.group(1), "amount": float(amts[-1].replace(",", ""))})
+
+    leave_rows: list[dict] = []
+    for line in lines:
+        if "Annual Leave" in line and "Hours" in line:
+            nums = re.findall(r"\d+\.\d+", line)
+            if len(nums) >= 3:
+                leave_rows.append(
+                    {"kind": "Annual Leave (Hours)", "accrued": nums[0], "used": nums[1], "balance": nums[2]}
+                )
+        if "Sick Leave" in line and "Hours" in line:
+            nums = re.findall(r"\d+\.\d+", line)
+            if len(nums) >= 3:
+                leave_rows.append(
+                    {"kind": "Sick Leave (Hours)", "accrued": nums[0], "used": nums[1], "balance": nums[2]}
+                )
+
+    return {
+        "name": name,
+        "address_lines": address_lines,
+        "employment_lines": employment_lines,
+        "pay_period": pay_period,
+        "payment_date": payment_date,
+        "total_earnings": total_earnings,
+        "net_pay": net_pay,
+        "earnings": earnings,
+        "tax_rows": tax_rows,
+        "payments": payments,
+        "leave_rows": leave_rows,
+    }
+
+
+def _payslip_parse_looks_ok(d: dict) -> bool:
+    if d.get("name"):
+        return True
+    if d.get("earnings"):
+        return True
+    te = d.get("total_earnings")
+    np = d.get("net_pay")
+    if te is not None and te > 0:
+        return True
+    if np is not None and np > 0:
+        return True
+    return False
+
+
+def payslip_dict_to_sheet_rows(d: dict) -> list[list[str]]:
+    out: list[list[str]] = []
+
+    def add(cells: list):
+        out.append(_pad_row(cells))
+
+    add(["EMPLOYMENT DETAILS"])
+    for el in d.get("employment_lines") or []:
+        add([el])
+    add([])
+    nm = d.get("name") or ""
+    add(["", "", "", "", "", "", nm, "", "", ""])
+    for al in d.get("address_lines") or []:
+        add(["", "", "", "", "", "", al, "", "", ""])
+    add([])
+    add(
+        [
+            f"Pay Period: {d.get('pay_period') or ''}",
+            "",
+            "",
+            f"Payment Date: {d.get('payment_date') or ''}",
+            "",
+            "",
+            f"Total Earnings: {_fmt_money(d.get('total_earnings'))}",
+            "",
+            f"Net Pay: {_fmt_money(d.get('net_pay'))}",
+            "",
+        ]
+    )
+    add([])
+    add(["EARNINGS", "QUANTITY", "RATE", "THIS PAY", "YTD"])
+    for e in d.get("earnings") or []:
+        add(
+            [
+                e.get("name") or "",
+                _fmt_qty(e.get("quantity")) if e.get("quantity") is not None else "",
+                _fmt_qty(e.get("rate")) if e.get("rate") is not None else "",
+                _fmt_money(e.get("this_pay")),
+                _fmt_money(e.get("ytd")) if e.get("ytd") is not None else "",
+            ]
+        )
+    te_sum = sum((x.get("this_pay") or 0) for x in (d.get("earnings") or []) if isinstance(x.get("this_pay"), (int, float)))
+    ytd_sum = sum((x.get("ytd") or 0) for x in (d.get("earnings") or []) if isinstance(x.get("ytd"), (int, float)))
+    if d.get("earnings"):
+        te_cell = d.get("total_earnings")
+        tp = _fmt_money(te_cell if te_cell is not None else te_sum)
+        ytd_cell = _fmt_money(ytd_sum) if ytd_sum else ""
+        add(["TOTAL", "", "", tp, ytd_cell])
+    if d.get("tax_rows"):
+        add([])
+        add(["TAX", "", "", "THIS PAY", "YTD"])
+        for tr in d["tax_rows"]:
+            add([tr.get("name") or "", "", "", _fmt_money(tr.get("this_pay")), _fmt_money(tr.get("ytd"))])
+        t_this = sum(x.get("this_pay") or 0 for x in d["tax_rows"] if isinstance(x.get("this_pay"), (int, float)))
+        t_ytd = sum(x.get("ytd") or 0 for x in d["tax_rows"] if isinstance(x.get("ytd"), (int, float)))
+        add(["TOTAL", "", "", _fmt_money(t_this), _fmt_money(t_ytd) if t_ytd else ""])
+    if d.get("payments"):
+        add([])
+        add(["PAYMENTS", "PARTICULARS", "CODE", "REFERENCE", "AMOUNT"])
+        for p in d["payments"]:
+            add(["Bank Account Number", p.get("particulars") or "", "", "", _fmt_money(p.get("amount"))])
+        pam = sum(x.get("amount") or 0 for x in d["payments"] if isinstance(x.get("amount"), (int, float)))
+        add(["TOTAL", "", "", "", _fmt_money(pam)])
+    if d.get("leave_rows"):
+        add([])
+        add(["LEAVE", "ACCRUED", "USED", "BALANCE"])
+        for lr in d["leave_rows"]:
+            add([lr.get("kind") or "", lr.get("accrued") or "", lr.get("used") or "", lr.get("balance") or ""])
+    return out
+
+
+def _pdf_page_count(pdf_path: Path) -> int:
+    if pdfplumber is not None:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            return len(pdf.pages)
+    if fitz is not None:
+        doc = fitz.open(str(pdf_path))
+        try:
+            return len(doc)
+        finally:
+            doc.close()
+    return 0
+
+
 def convert_pdf_to_excel(
     pdf_path: Path,
     xlsx_path: Path,
     page_indices: list[int] | None = None,
     mode: str = "auto",
+    sheet_format: str = "grid",
 ) -> tuple[int, str | None]:
     if not pdf_path.is_file():
         return 1, f"找不到文件: {pdf_path}"
+
+    if sheet_format == "payslip":
+        if pdfplumber is None and fitz is None:
+            return (
+                1,
+                "payslip 版式需要 pdfplumber 或 pymupdf：pip install pdfplumber 或 pip install pymupdf",
+            )
+        n = _pdf_page_count(pdf_path)
+        if n == 0:
+            return 1, "无法读取 PDF 页数。"
+        idxs = page_indices if page_indices is not None else list(range(n))
+        idxs = [i for i in idxs if 0 <= i < n]
+        if not idxs:
+            return 1, "没有选中任何有效页码。"
+        bases = [f"Table {si + 1}" for si in range(len(idxs))]
+        names = _unique_sheet_names(bases)
+        sheets: list[tuple[str, list[list[str]]]] = []
+        for si, i in enumerate(idxs):
+            text = _extract_page_plain_text(pdf_path, i)
+            data = parse_payslip_export_dict(text)
+            rows = payslip_dict_to_sheet_rows(data)
+            if not _payslip_parse_looks_ok(data):
+                rows.append(_pad_row([]))
+                rows.append(_pad_row(["(Could not fully parse; raw lines below)"]))
+                for ln in text.splitlines():
+                    rows.append(_pad_row([ln]))
+            sheets.append((names[si], rows))
+
+        xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+        with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+            for name, rows in sheets:
+                pd.DataFrame(rows).to_excel(writer, sheet_name=name, index=False, header=False)
+        return 0, None
 
     if pdfplumber is not None:
         with pdfplumber.open(str(pdf_path)) as pdf:
@@ -312,9 +744,10 @@ def _print_usage_hint() -> None:
         "用法（必须把 PDF 路径写在命令后面）：\n"
         "  python pdf_to_excel.py  工资单.pdf\n"
         "  python pdf_to_excel.py  工资单.pdf -o 输出.xlsx\n"
-        "  python pdf_to_excel.py  工资单.pdf --mode text\n"
+        "  python pdf_to_excel.py  工资单.pdf --sheet-format payslip\n"
         "\n"
-        "工资单类 PDF 若信息不全，可加 --mode text（整页版式文本）或 --mode both（表格+全文）。\n"
+        "工资单版式（多列、Table 1…工作表）用 --sheet-format payslip；"
+        "若只要整页文字用 --mode text。\n"
         "\n"
         "Windows：请把 PDF 拖到 pdf_to_excel.bat 上再松开，不要只双击 BAT（那样没有文件可转）。",
         file=sys.stderr,
@@ -341,7 +774,19 @@ def main(argv: list[str]) -> int:
         "--mode",
         choices=("auto", "text", "tables", "both"),
         default="auto",
-        help="auto=智能在表格与版式文本间选择（默认）；text=整页文本行；tables=仅表格；both=表格后附全文",
+        help="grid 模式：auto=智能在表格与版式文本间选择；text=整页文本行；tables=仅表格；both=表格后附全文",
+    )
+    p.add_argument(
+        "--sheet-format",
+        choices=("grid", "payslip"),
+        default="grid",
+        help="grid=按页导出单元格网格（默认）；payslip=按工资单版式导出，工作表名为 Table 1…（接近 Xero 多表）",
+    )
+    p.add_argument(
+        "--pages",
+        type=str,
+        default=None,
+        help='只导出部分页，1 起始，如: "1,3,5-8"',
     )
     args = p.parse_args(argv)
 
@@ -362,7 +807,13 @@ def main(argv: list[str]) -> int:
         finally:
             doc.close()
 
-    code, err = convert_pdf_to_excel(pdf_path, out, page_indices, mode=args.mode)
+    code, err = convert_pdf_to_excel(
+        pdf_path,
+        out,
+        page_indices,
+        mode=args.mode,
+        sheet_format=args.sheet_format,
+    )
     if err:
         print(err, file=sys.stderr)
         return code
