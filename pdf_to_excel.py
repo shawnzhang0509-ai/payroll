@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 PDF → Excel 小工具：每页一个工作表。
-默认按页导出网格（--sheet-format grid）。工资单可改用 --sheet-format payslip（Table 1…，多列表头）。
+默认按页导出网格（--sheet-format grid）。工资单可改用 --sheet-format payslip（Table 1…）；
+payslip 模式会在写入前用明细行修正汇总区 Total/Net（避免 PDF 汇总行为 0 的占位数字）。
 依赖: pip install pdfplumber pandas openpyxl
 可选: pip install pymupdf  （仅作无 pdfplumber 时的文字回退）
 
@@ -351,6 +352,68 @@ def _guess_name_address(lines: list[str]) -> tuple[str | None, list[str]]:
     return name, addr
 
 
+def _label_money_first_nonzero(text: str, patterns: tuple[str, ...]) -> float | None:
+    """Same idea as payroll Excel import: skip leading $0.00 from noisy PDF text."""
+    for pat in patterns:
+        for m in re.finditer(pat, text, re.I | re.MULTILINE):
+            try:
+                v = float(m.group(1).replace(",", ""))
+                if abs(v) > 1e-9:
+                    return v
+            except (ValueError, IndexError):
+                continue
+    return None
+
+
+def _earning_line_money(e: dict) -> float:
+    """Amount used for reconciling totals when THIS PAY is 0 but YTD has the figure."""
+    tp = e.get("this_pay")
+    yd = e.get("ytd")
+    if isinstance(tp, (int, float)) and abs(float(tp)) > 1e-9:
+        return float(tp)
+    if isinstance(yd, (int, float)) and abs(float(yd)) > 1e-9:
+        return float(yd)
+    return 0.0
+
+
+def finalize_payslip_totals(d: dict) -> None:
+    """
+    PDF 转表时汇总行常为 $0；在写入 Excel 前用明细 + 税务 + 银行行对齐 Total / Net，
+    减轻下游 payroll_analyzer 的误判。
+    """
+    earnings = d.get("earnings") or []
+    inferred_total = sum(_earning_line_money(e) for e in earnings)
+
+    te = d.get("total_earnings")
+    if te is None or (isinstance(te, (int, float)) and abs(float(te)) < 1e-9):
+        if inferred_total > 1e-9:
+            d["total_earnings"] = inferred_total
+            te = inferred_total
+
+    np = d.get("net_pay")
+    if np is None or (isinstance(np, (int, float)) and abs(float(np)) < 1e-9):
+        payments = d.get("payments") or []
+        bank_max = 0.0
+        for p in payments:
+            a = p.get("amount")
+            if isinstance(a, (int, float)) and float(a) > bank_max:
+                bank_max = float(a)
+        if bank_max > 1e-9:
+            d["net_pay"] = bank_max
+            return
+
+        te_f = float(d.get("total_earnings") or 0)
+        paye_this = 0.0
+        for tr in d.get("tax_rows") or []:
+            x = tr.get("this_pay")
+            if isinstance(x, (int, float)) and float(x) > paye_this:
+                paye_this = float(x)
+        if te_f > 1e-9 and paye_this > 1e-9 and te_f > paye_this + 1e-6:
+            d["net_pay"] = te_f - paye_this
+        elif te_f > 1e-9:
+            d["net_pay"] = te_f
+
+
 def parse_payslip_export_dict(text: str) -> dict:
     """Parse one payslip page (Xero-style text). Keeps logic self-contained (no PyQt import)."""
     lines = text.split("\n")
@@ -375,15 +438,23 @@ def parse_payslip_export_dict(text: str) -> dict:
     if m:
         payment_date = m.group(1).strip()
 
-    total_earnings = None
-    m = re.search(r"Total Earnings:\s*\$?([\d,]+\.\d+)", t, re.I)
-    if m:
-        total_earnings = float(m.group(1).replace(",", ""))
+    total_earnings = _label_money_first_nonzero(
+        t,
+        (
+            r"Total\s+Earnings:\s*\$?([\d,]+\.\d+)",
+            r"Gross\s+(?:Pay|Earnings|Income):\s*\$?([\d,]+\.\d+)",
+            r"Total\s+Gross:\s*\$?([\d,]+\.\d+)",
+        ),
+    )
 
-    net_pay = None
-    m = re.search(r"Net Pay:\s*\$?([\d,]+\.\d+)", t, re.I)
-    if m:
-        net_pay = float(m.group(1).replace(",", ""))
+    net_pay = _label_money_first_nonzero(
+        t,
+        (
+            r"Net\s+Pay:\s*\$?([\d,]+\.\d+)",
+            r"(?:Take\s*Home|Take-home|Net\s+Amount|Amount\s+Payable):\s*\$?([\d,]+\.\d+)",
+            r"Pay\s+into\s+bank:\s*\$?([\d,]+\.\d+)",
+        ),
+    )
 
     employment_lines: list[str] = []
     for raw in lines[:45]:
@@ -671,6 +742,7 @@ def convert_pdf_to_excel(
         for si, i in enumerate(idxs):
             text = _extract_page_plain_text(pdf_path, i)
             data = parse_payslip_export_dict(text)
+            finalize_payslip_totals(data)
             rows = payslip_dict_to_sheet_rows(data)
             if not _payslip_parse_looks_ok(data):
                 rows.append(_pad_row([]))
