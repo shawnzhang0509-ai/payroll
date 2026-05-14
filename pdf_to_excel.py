@@ -208,7 +208,23 @@ def convert_pdf_to_excel(
     return 0, None
 
 
+def _print_usage_hint() -> None:
+    print(
+        "用法（必须把 PDF 路径写在命令后面）：\n"
+        "  python pdf_to_excel.py  工资单.pdf\n"
+        "  python pdf_to_excel.py  工资单.pdf -o 输出.xlsx\n"
+        "  python pdf_to_excel.py  工资单.pdf --pages \"1,3,5-8\"\n"
+        "\n"
+        "Windows：请把 PDF 拖到 pdf_to_excel.bat 上再松开，不要只双击 BAT（那样没有文件可转）。",
+        file=sys.stderr,
+    )
+
+
 def main(argv: list[str]) -> int:
+    if not argv:
+        _print_usage_hint()
+        return 2
+
     p = argparse.ArgumentParser(
         description="将 PDF 转为 Excel（每页一表；优先表格识别，否则文本行）。"
     )
