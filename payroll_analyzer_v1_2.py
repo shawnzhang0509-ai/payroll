@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.5 (import JSON backup + fix export JSON path)
+Version: 1.4.6 (atomic JSON save + permission hints)
 """
 
 import copy
@@ -10,6 +10,7 @@ import sys
 import os
 import json
 import re
+import time
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -130,6 +131,49 @@ def branch_display_label(canonical_key: str, samples: set) -> str:
     return next(iter(samples)).strip()
 
 
+def atomic_write_json(filepath: str, obj: dict, max_retries: int = 6) -> None:
+    """
+    先写临时文件再 os.replace，避免写到一半崩溃；Windows 下文件被占用时会失败，
+    故带指数退避重试。
+    """
+    path = os.path.abspath(filepath)
+    dirname = os.path.dirname(path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+    tmp_path = path + '.tmp'
+    text = json.dumps(obj, ensure_ascii=False, indent=2)
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+            return
+        except OSError as err:
+            last_err = err
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            if attempt < max_retries - 1:
+                time.sleep(0.08 * (2 ** attempt))
+    assert last_err is not None
+    raise last_err
+
+
+SAVE_PERMISSION_HINT = (
+    "\n\n常见解决办法：\n"
+    "• 关闭正在打开该 JSON 的记事本 / VS Code / 其他程序\n"
+    "• 右键文件 → 属性 → 取消「只读」\n"
+    "• 勿放在 OneDrive/网络盘同步文件夹（或暂停同步后再试）\n"
+    "• 把整个 payroll 文件夹移到「文档」等有写入权限的路径\n"
+    "• 若装在 Program Files 等目录，请改用管理员运行或移动项目位置"
+)
+
+
 class Employee:
     def __init__(self, name, name_key=None, branch="未分配", english_name=""):
         self.name = name
@@ -176,9 +220,10 @@ class PayrollDatabase:
         }
 
     def save_data(self):
-        with open(self.config.get('history_file', 'payroll_history.json'),
-                  'w', encoding='utf-8') as f:
-            json.dump(self.build_snapshot(), f, ensure_ascii=False, indent=2)
+        atomic_write_json(
+            self.config.get('history_file', 'payroll_history.json'),
+            self.build_snapshot(),
+        )
 
     def import_snapshot(self, data, replace: bool, import_mapping: bool):
         """从 JSON 字典合并或覆盖；结构与 build_snapshot 一致。"""
@@ -990,7 +1035,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.5")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.6")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
@@ -1009,8 +1054,7 @@ class PayrollAnalyzer(QMainWindow):
         return DEFAULT_CONFIG.copy()
 
     def save_config(self):
-        with open('payroll_config.json', 'w', encoding='utf-8') as f:
-            json.dump(self.config, f, ensure_ascii=False, indent=2)
+        atomic_write_json('payroll_config.json', self.config)
 
     def setup_menu(self):
         menubar = self.menuBar()
@@ -1549,6 +1593,17 @@ class PayrollAnalyzer(QMainWindow):
             self.refresh_all()
             self.status.showMessage(f"已从 JSON 载入：{os.path.basename(filepath)}")
             QMessageBox.information(self, "导入成功", "JSON 数据已写入当前工资库。")
+        except OSError as e:
+            errno = getattr(e, 'errno', None)
+            if errno == 13 or 'Permission denied' in str(e):
+                QMessageBox.critical(
+                    self,
+                    "无法保存工资库文件",
+                    str(e) + SAVE_PERMISSION_HINT,
+                )
+            else:
+                QMessageBox.critical(self, "导入失败", str(e))
+            traceback.print_exc()
         except Exception as e:
             QMessageBox.critical(self, "导入失败", str(e))
             traceback.print_exc()
@@ -2139,8 +2194,7 @@ class PayrollAnalyzer(QMainWindow):
             if filepath:
                 try:
                     snap = self.db.build_snapshot()
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        json.dump(snap, f, ensure_ascii=False, indent=2)
+                    atomic_write_json(filepath, snap)
                     QMessageBox.information(
                         self, "导出成功", f"数据已保存到:\n{filepath}"
                     )
