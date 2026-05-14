@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PDF → Excel 小工具：每页一个工作表，优先抽取表格；若无表格则导出版式文本行。
+PDF → Excel 小工具：每页一个工作表。
+默认 auto：尝试表格，但若识别结果明显“比整页文字短很多”（常见工资单无框线），
+则改用版式文本行，避免只剩两三行 TOTAL。
 依赖: pip install pdfplumber pandas openpyxl
-可选: pip install pymupdf  （仅作无表格时的文字回退，与主程序一致）
+可选: pip install pymupdf  （仅作无 pdfplumber 时的文字回退）
 
 扫描件/纯图片 PDF 需先 OCR，本工具无法从像素恢复表格。
 """
@@ -103,15 +105,137 @@ def _page_tables_to_rows(tables: list) -> list[list[str]]:
     return out
 
 
-def _page_text_fallback_pdfplumber(page) -> list[list[str]]:
-    t = page.extract_text(layout=True) or page.extract_text() or ""
-    lines = t.splitlines()
-    if not lines:
+def _text_rows_pdfplumber(page) -> list[list[str]]:
+    """Full-page text as one column per line (layout mode matches payroll_analyzer)."""
+    t = None
+    try:
+        t = page.extract_text(layout=True, x_tolerance=2, y_tolerance=2)
+    except TypeError:
+        t = page.extract_text(layout=True)
+    if not t:
+        try:
+            t = page.extract_text(x_tolerance=2, y_tolerance=2)
+        except TypeError:
+            t = page.extract_text()
+    if not t:
+        t = page.extract_text(layout=True) or page.extract_text() or ""
+    lines = [ln.rstrip() for ln in t.splitlines()]
+    if not any(x.strip() for x in lines):
         return [["(此页无文字，可能是扫描图；请先 OCR)"]]
     return [[ln] for ln in lines]
 
 
-def _page_text_fallback_pymupdf(doc: "fitz.Document", page_index: int) -> list[list[str]]:
+def _page_text_fallback_pdfplumber(page) -> list[list[str]]:
+    return _text_rows_pdfplumber(page)
+
+
+def _extract_tables_merged(page) -> list[list[str]]:
+    """Return merged grid rows from pdfplumber, or [] if no usable tables."""
+    try:
+        tables = page.extract_tables(
+            table_settings={
+                "vertical_strategy": "lines",
+                "horizontal_strategy": "lines",
+                "intersection_tolerance": 3,
+            }
+        )
+    except Exception:
+        tables = page.extract_tables()
+
+    if not tables or all(not t for t in tables):
+        try:
+            tables = page.extract_tables(
+                table_settings={
+                    "vertical_strategy": "text",
+                    "horizontal_strategy": "text",
+                }
+            )
+        except Exception:
+            tables = []
+
+    if not tables or all(not t for t in tables):
+        return []
+    merged = _page_tables_to_rows([t for t in tables if t])
+    if merged == [[""]]:
+        return []
+    return merged
+
+
+def _nonblank_line_count(rows: list[list[str]]) -> int:
+    n = 0
+    for r in rows:
+        if any((c or "").strip() for c in r):
+            n += 1
+    return n
+
+
+def _nonblank_char_count(rows: list[list[str]]) -> int:
+    return sum(len((c or "").strip()) for r in rows for c in r)
+
+
+def _text_char_count(text_rows: list[list[str]]) -> int:
+    return sum(len((r[0] or "").strip()) for r in text_rows if r)
+
+
+def _pad_rows(rows: list[list[str]], width: int) -> list[list[str]]:
+    out: list[list[str]] = []
+    for r in rows:
+        rr = list(r)
+        if len(rr) < width:
+            rr.extend([""] * (width - len(rr)))
+        else:
+            rr = rr[:width]
+        out.append(rr)
+    return out
+
+
+def _page_rows_pdfplumber(page, mode: str) -> list[list[str]]:
+    """
+    mode:
+      auto  — tables if they look complete vs full-page text; else layout text
+      text  — always layout text (best for many payslips)
+      tables— tables only, fallback to text if none
+      both  — tables then separator then full text
+    """
+    text_rows = _text_rows_pdfplumber(page)
+    table_rows = _extract_tables_merged(page)
+
+    if mode == "text":
+        return text_rows
+
+    if mode == "tables":
+        return table_rows if table_rows else text_rows
+
+    if mode == "both":
+        if not table_rows:
+            return text_rows
+        maxc = max(max(len(r) for r in table_rows), max((len(r) for r in text_rows), 1))
+        sep = _pad_rows([["--- full page text below ---"]], maxc)
+        blank = _pad_rows([[""]], maxc)
+        return (
+            _pad_rows(table_rows, maxc)
+            + blank
+            + sep
+            + blank
+            + _pad_rows(text_rows, maxc)
+        )
+
+    # ---- auto ----
+    if not table_rows:
+        return text_rows
+
+    tl = _nonblank_line_count(text_rows)
+    tb = _nonblank_line_count(table_rows)
+    tc_txt = _text_char_count(text_rows)
+    tc_tbl = _nonblank_char_count(table_rows)
+
+    if tl >= 10:
+        if tb <= max(5, tl // 3) and tc_tbl < tc_txt * 0.38:
+            return text_rows
+        if tc_txt > 450 and tc_tbl < max(350, int(tc_txt * 0.34)):
+            return text_rows
+
+    return table_rows
     page = doc.load_page(page_index)
     t = page.get_text("text") or ""
     lines = t.splitlines()
@@ -124,6 +248,7 @@ def convert_pdf_to_excel(
     pdf_path: Path,
     xlsx_path: Path,
     page_indices: list[int] | None = None,
+    mode: str = "auto",
 ) -> tuple[int, str | None]:
     if not pdf_path.is_file():
         return 1, f"找不到文件: {pdf_path}"
@@ -142,33 +267,7 @@ def convert_pdf_to_excel(
             sheets: list[tuple[str, list[list[str]]]] = []
             for i, name in zip(idxs, names):
                 page = pdf.pages[i]
-                try:
-                    tables = page.extract_tables(
-                        table_settings={
-                            "vertical_strategy": "lines",
-                            "horizontal_strategy": "lines",
-                            "intersection_tolerance": 3,
-                        }
-                    )
-                except Exception:
-                    tables = page.extract_tables()
-
-                if not tables or all(not t for t in tables):
-                    try:
-                        tables = page.extract_tables(
-                            table_settings={
-                                "vertical_strategy": "text",
-                                "horizontal_strategy": "text",
-                            }
-                        )
-                    except Exception:
-                        tables = []
-
-                rows: list[list[str]]
-                if tables and any(t for t in tables):
-                    rows = _page_tables_to_rows([t for t in tables if t])
-                else:
-                    rows = _page_text_fallback_pdfplumber(page)
+                rows = _page_rows_pdfplumber(page, mode)
                 sheets.append((name, rows))
 
         xlsx_path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,7 +312,9 @@ def _print_usage_hint() -> None:
         "用法（必须把 PDF 路径写在命令后面）：\n"
         "  python pdf_to_excel.py  工资单.pdf\n"
         "  python pdf_to_excel.py  工资单.pdf -o 输出.xlsx\n"
-        "  python pdf_to_excel.py  工资单.pdf --pages \"1,3,5-8\"\n"
+        "  python pdf_to_excel.py  工资单.pdf --mode text\n"
+        "\n"
+        "工资单类 PDF 若信息不全，可加 --mode text（整页版式文本）或 --mode both（表格+全文）。\n"
         "\n"
         "Windows：请把 PDF 拖到 pdf_to_excel.bat 上再松开，不要只双击 BAT（那样没有文件可转）。",
         file=sys.stderr,
@@ -237,10 +338,10 @@ def main(argv: list[str]) -> int:
         help="输出 .xlsx 路径（默认与 PDF 同目录、同名）",
     )
     p.add_argument(
-        "--pages",
-        type=str,
-        default=None,
-        help='只导出部分页，1 起始，如: "1,3,5-8"',
+        "--mode",
+        choices=("auto", "text", "tables", "both"),
+        default="auto",
+        help="auto=智能在表格与版式文本间选择（默认）；text=整页文本行；tables=仅表格；both=表格后附全文",
     )
     args = p.parse_args(argv)
 
@@ -261,7 +362,7 @@ def main(argv: list[str]) -> int:
         finally:
             doc.close()
 
-    code, err = convert_pdf_to_excel(pdf_path, out, page_indices)
+    code, err = convert_pdf_to_excel(pdf_path, out, page_indices, mode=args.mode)
     if err:
         print(err, file=sys.stderr)
         return code
