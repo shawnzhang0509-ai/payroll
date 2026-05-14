@@ -1,6 +1,10 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+REM UTF-8 code page: clearer Unicode paths in this window (Chinese Windows defaults to CP936).
+chcp 65001 >nul 2>&1
+REM UTF-8 mode for Python (helps PDF paths with non-ASCII characters).
+set PYTHONUTF8=1
 
 set "TOOL=%~dp0pdf_to_excel.py"
 if not exist "%TOOL%" (
@@ -9,14 +13,16 @@ if not exist "%TOOL%" (
     exit /b 1
 )
 
-REM Double-click runs with no args — need a PDF path (e.g. drag PDF onto this BAT).
+REM Avoid non-ASCII in echo lines: cmd misreads UTF-8 batch files under CP936.
+
+REM Double-click runs with no PDF path. Drag-and-drop a .pdf onto this BAT, or pass the path.
 if "%~1"=="" (
     echo.
-    echo 【未指定 PDF】不要只双击本 BAT，否则不知道要转哪个文件。
+    echo [NO PDF] Do not double-click this BAT alone. It needs the PDF file path.
     echo.
-    echo 方式一: 把 PDF 拖到本 BAT 图标上，松开鼠标
-    echo 方式二: 先打开 cmd，进入本目录后执行:
-    echo   pdf_to_excel.bat "D:\路径\工资单.pdf"
+    echo Option A: Drag your .pdf file onto this BAT file and release.
+    echo Option B: In cmd, cd to this folder, then run:
+    echo   pdf_to_excel.bat "D:\path\to\payslip.pdf"
     echo.
     pause
     exit /b 1
