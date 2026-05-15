@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.15 (name: flat/address reject; mapping keywords word-aware)
+Version: 1.4.16 (Excel EARNINGS grid stops at Total / PAYE / KiwiSaver rows)
 """
 
 import copy
@@ -600,7 +600,7 @@ class ExcelPayslipImporter:
     """
     Xero / 模板类工资单 Excel：
     - 多工作表或单表多块（按「Pay Period + Payment Date」汇总行切分）；
-    - 收入金额只认 **THIS PAY**（单元格空则按 0），**绝不从 YTD 列补数**；YTD 仅用于表头定位。
+    - 收入网格在遇到 **Total… / PAYE / KiwiSaver / Superannuation** 等行时结束，避免把税务与扣款 THIS PAY 误累加成收入。
     - 共用表头下的「年假/病假」行不参与收入解析；汇总 Total/Net 均为 0 时丢弃误解析的大额明细。
     - 已定位到 THIS PAY 表头且首行即假期时，不启用全文 PDF 回退（避免 YTD/邻页数字混入）。
     - 姓名启发式见 `payslip_name_utils.payslip_name_is_plausible`（排除 Pay Frequency 等标签与地址行）。
@@ -962,6 +962,40 @@ class ExcelPayslipImporter:
         return False
 
     @classmethod
+    def _label_ends_xero_earnings_block(cls, ls: str) -> bool:
+        """
+        在「QUANTITY / THIS PAY」网格里，收入块结束后紧跟 TAX、合计、PAYE 等行；
+        若不在「Total…」处停止，会把 PAYE/KiwiSaver 的 THIS PAY 误当收入累加（如 Total 虚高）。
+        """
+        if not ls:
+            return False
+        ul = ls.upper()
+        low = ls.strip().lower()
+        if ul == 'TAX' or ul == 'LEAVE':
+            return True
+        if ul.startswith('DEDUCTION'):
+            return True
+        if re.match(r'^total\b', low):
+            return True
+        if re.match(r'^paye\b', low):
+            return True
+        if re.match(r'^esct\b', low):
+            return True
+        if 'student loan' in low:
+            return True
+        if re.search(r'\bkiwisaver\b', low) and 'earning' not in low:
+            return True
+        if re.search(r'\bsuperannuation\b', low):
+            return True
+        if re.match(r'^net\s+pay\b', low):
+            return True
+        if re.match(r'^payments\b', low):
+            return True
+        if re.match(r'^bank\s+', low):
+            return True
+        return False
+
+    @classmethod
     def _parse_earnings_rows(cls, rows, data_start, this_pay_col, _ytd_col, qty_col, rate_col):
         earnings = []
         if this_pay_col is None:
@@ -977,14 +1011,10 @@ class ExcelPayslipImporter:
 
             if not ls:
                 continue
-            if ul == 'TAX' or ul == 'LEAVE':
-                break
-            if ul.startswith('DEDUCTION'):
+            if cls._label_ends_xero_earnings_block(ls):
                 break
             if ul == 'EARNINGS':
                 continue
-            if ul == 'TOTAL' or ls.lower() == 'total':
-                break
             if cls._row_looks_like_leave_not_earnings(row, ls):
                 break
 
@@ -1024,12 +1054,13 @@ class ExcelPayslipImporter:
                 continue
             lab = cls._first_label_cell(row, max(tp_col, 5))
             ul = (lab or '').strip().upper()
-            if ul == 'TAX' or ul == 'LEAVE':
-                break
             if cls._row_looks_like_leave_not_earnings(row, lab):
                 break
-            if ul == 'TOTAL':
+            low = (lab or '').strip().lower()
+            if re.match(r'^total\b', low) or (lab or '').strip().upper() == 'TOTAL':
                 return cls._float_cell(row[tp_col]) if len(row) > tp_col else 0.0
+            if cls._label_ends_xero_earnings_block(lab):
+                break
         return None
 
     @classmethod
@@ -1237,7 +1268,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.15")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.16")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
