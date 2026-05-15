@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.8 (Excel Table template: multiple payslips per sheet)
+Version: 1.4.9 (Excel earnings: amount = THIS PAY column only)
 """
 
 import copy
@@ -923,6 +923,9 @@ class ExcelPayslipImporter:
 
     @classmethod
     def _parse_earnings_rows(cls, rows, data_start, this_pay_col, ytd_col, qty_col, rate_col):
+        """
+        每条收入的 amount 只取 THIS PAY 列，不回填 YTD（本期为 0 则记 0）。
+        """
         earnings = []
         if this_pay_col is None:
             return earnings
@@ -963,12 +966,6 @@ class ExcelPayslipImporter:
                 else 0.0
             )
 
-            if abs(amt) < 1e-9 and ytd_col is not None and len(row) > ytd_col:
-                amt = cls._float_cell(row[ytd_col])
-
-            if abs(amt) < 1e-9:
-                continue
-
             earnings.append({
                 'name': ls,
                 'quantity': qty,
@@ -981,8 +978,7 @@ class ExcelPayslipImporter:
     @classmethod
     def _earnings_block_total(cls, rows, data_start, tp_col, ytd_col):
         """
-        Xero 表单式导出：汇总行 Total Earnings 常为 $0，但 EARNINGS 块末行 TOTAL 的
-        THIS PAY / YTD 列才是可信合计。
+        EARNINGS 块末行 TOTAL：仅用 THIS PAY 列推断总工资（不用 YTD 代替本期）。
         """
         if data_start is None or tp_col is None or ytd_col is None:
             return None, None
@@ -1087,12 +1083,9 @@ class ExcelPayslipImporter:
                 if net_pay == 0 and alt.get('net_pay'):
                     net_pay = alt['net_pay']
 
-        tp_tot, ytd_tot = cls._earnings_block_total(rows, data_start, tp_col, ytd_col)
-        if total_earnings < 1e-6:
-            if tp_tot is not None and tp_tot > 1e-6:
-                total_earnings = tp_tot
-            elif ytd_tot is not None and ytd_tot > 1e-6:
-                total_earnings = ytd_tot
+        tp_tot, _ytd_tot = cls._earnings_block_total(rows, data_start, tp_col, ytd_col)
+        if total_earnings < 1e-6 and tp_tot is not None and tp_tot > 1e-6:
+            total_earnings = tp_tot
 
         sum_lines = sum(e['amount'] for e in earnings)
         if total_earnings < 1e-6 and sum_lines > 0:
@@ -1173,7 +1166,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.8")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.9")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()

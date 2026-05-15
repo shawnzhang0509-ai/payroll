@@ -366,13 +366,10 @@ def _label_money_first_nonzero(text: str, patterns: tuple[str, ...]) -> float | 
 
 
 def _earning_line_money(e: dict) -> float:
-    """Amount used for reconciling totals when THIS PAY is 0 but YTD has the figure."""
+    """与 payroll 一致：合计只加 THIS PAY，不加 YTD。"""
     tp = e.get("this_pay")
-    yd = e.get("ytd")
     if isinstance(tp, (int, float)) and abs(float(tp)) > 1e-9:
         return float(tp)
-    if isinstance(yd, (int, float)) and abs(float(yd)) > 1e-9:
-        return float(yd)
     return 0.0
 
 
