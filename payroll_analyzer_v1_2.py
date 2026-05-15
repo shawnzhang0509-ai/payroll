@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.19 (UI shows payslip name; global name guess; sync Employee.name)
+Version: 1.4.20 (Payslip week replace + heal/prune bad employee names from JSON)
 """
 
 import copy
@@ -218,6 +218,38 @@ class PayrollDatabase:
                 self.history = data.get('history', {})
             except Exception as e:
                 print(f"加载历史数据失败: {e}")
+        self._heal_employee_names_from_history()
+        self.prune_orphan_implausible_employees()
+
+    def _heal_employee_names_from_history(self):
+        """若主档姓名为地址/噪声，用各周 history 里同 name_key 下可信的 payslip name 覆盖。"""
+        for _nk, emp in self.employees.items():
+            if payslip_name_is_plausible(emp.name):
+                continue
+            best = None
+            for wk in sorted(self.history.keys(), reverse=True):
+                rec = self.history[wk].get(emp.name_key)
+                if not isinstance(rec, dict):
+                    continue
+                cand = (rec.get('name') or '').strip()
+                if payslip_name_is_plausible(cand):
+                    best = cand
+                    break
+            if best:
+                emp.name = best
+
+    def prune_orphan_implausible_employees(self):
+        """删除任意周 history 均未引用、且姓名不像真人的员工（如误导入的地址行）。"""
+        used = set()
+        for rows in self.history.values():
+            if isinstance(rows, dict):
+                used.update(rows.keys())
+        for nk in list(self.employees.keys()):
+            if nk in used:
+                continue
+            emp = self.employees[nk]
+            if not payslip_name_is_plausible(emp.name):
+                del self.employees[nk]
 
     def build_snapshot(self):
         return {
@@ -262,12 +294,23 @@ class PayrollDatabase:
                     continue
                 if nk in self.employees:
                     e = self.employees[nk]
-                    e.name = ed.get('name', e.name)
+                    incoming = ed.get('name')
+                    if incoming is not None and incoming != '':
+                        if payslip_name_is_plausible(incoming):
+                            e.name = incoming
+                        elif not payslip_name_is_plausible(e.name):
+                            e.name = incoming
                     e.branch = ed.get('branch', e.branch)
                     e.english_name = ed.get('english_name', e.english_name)
                 else:
+                    raw_nm = ed.get('name', '') or ''
+                    nm0 = (
+                        raw_nm
+                        if payslip_name_is_plausible(raw_nm.strip())
+                        else '未命名员工'
+                    )
                     self.employees[nk] = Employee(
-                        ed.get('name', ''),
+                        nm0,
                         nk,
                         ed.get('branch', '未分配'),
                         ed.get('english_name', ''),
@@ -282,11 +325,15 @@ class PayrollDatabase:
         if import_mapping and data.get('category_mapping'):
             self.mapping_rules = copy.deepcopy(data['category_mapping'])
 
+        self._heal_employee_names_from_history()
+        self.prune_orphan_implausible_employees()
+
     def get_or_create_employee(self, name, name_key=None, branch="未分配"):
         key = name_key or name.lower().strip()
         nm = (name or '').strip()
         if key not in self.employees:
-            self.employees[key] = Employee(nm or '未命名', key, branch)
+            safe_nm = nm if payslip_name_is_plausible(nm) else '未命名员工'
+            self.employees[key] = Employee(safe_nm or '未命名员工', key, branch)
             self.save_data()
         else:
             emp = self.employees[key]
@@ -1296,7 +1343,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.19")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.20")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
@@ -1721,8 +1768,17 @@ class PayrollAnalyzer(QMainWindow):
             traceback.print_exc()
 
     def _commit_payslip_week(self, all_data, week_id):
-        if week_id not in self.db.history:
-            self.db.history[week_id] = {}
+        """
+        以本次 Excel 为准重写该周工资单：避免旧版误解析的 name_key（如 andrews terrace）
+        与新版正确 key（boming yu）并存；仍按 name_key 保留该周已有工时。
+        """
+        prev_week = self.db.history.get(week_id, {})
+        hours_by_key = {
+            k: float((v or {}).get('hours', 0) or 0.0)
+            for k, v in prev_week.items()
+            if isinstance(v, dict)
+        }
+        self.db.history[week_id] = {}
 
         for data in all_data:
             name = data['name']
@@ -1738,7 +1794,7 @@ class PayrollAnalyzer(QMainWindow):
                 'payment_date': data.get('payment_date', ''),
                 'total_earnings': data.get('total_earnings', 0),
                 'net_pay': data.get('net_pay', 0),
-                'hours': 0,
+                'hours': hours_by_key.get(name_key, 0.0),
                 'raw_earnings': data.get('earnings', [])
             }
 
@@ -1766,6 +1822,7 @@ class PayrollAnalyzer(QMainWindow):
             payroll.update(categorized)
             self.db.history[week_id][name_key] = payroll
 
+        self.db.prune_orphan_implausible_employees()
         self.db.save_data()
         self.status.showMessage(f"成功导入 {len(all_data)} 条工资单到 {week_id}")
         self.refresh_all()
