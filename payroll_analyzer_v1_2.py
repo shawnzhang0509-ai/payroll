@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.7 (Excel payslip grid meta + totals inference)
+Version: 1.4.8 (Excel Table template: multiple payslips per sheet)
 """
 
 import copy
@@ -581,7 +581,9 @@ class ExcelHoursImporter:
 
 class ExcelPayslipImporter:
     """
-    Xero 等导出的「每人一页」Excel：工作簿中多个工作表，版式与 PDF 工资单类似。
+    Xero / 模板类工资单 Excel：
+    - 多工作表（Table 1、P1…）每人一张；或
+    - 单表纵向多块（同一 Table 1 内多个员工），按「Pay Period + Payment Date」汇总行切分后逐块解析。
     """
 
     _SKIP_NAME_SUB = (
@@ -634,8 +636,45 @@ class ExcelPayslipImporter:
                 lines.append(' '.join(parts))
         return '\n'.join(lines)
 
-    @staticmethod
-    def _find_pay_period_row(rows):
+    @classmethod
+    def _row_joined_lower(cls, row) -> str:
+        parts = []
+        for c in row:
+            if cls._is_na(c):
+                continue
+            s = str(c).strip().lower()
+            if s:
+                parts.append(s)
+        return ' '.join(parts)
+
+    @classmethod
+    def _is_payroll_summary_row(cls, row) -> bool:
+        """灰色汇总条：Pay Period 与 Payment Date / Total Earnings 等同行（或同一行拼接）。"""
+        j = cls._row_joined_lower(row)
+        if 'pay period' not in j:
+            return False
+        if 'tax period' in j and 'payment date' not in j and 'total earnings' not in j:
+            return False
+        return (
+            'payment date' in j
+            or 'total earnings' in j
+            or 'net pay' in j
+        )
+
+    @classmethod
+    def _find_all_summary_row_indices(cls, rows) -> list[int]:
+        """单表多员工时，每条汇总行开启一块工资单。"""
+        out = []
+        for ri, row in enumerate(rows):
+            if cls._is_payroll_summary_row(row):
+                out.append(ri)
+        return out
+
+    @classmethod
+    def _find_pay_period_row(cls, rows):
+        for ri, row in enumerate(rows):
+            if cls._is_payroll_summary_row(row):
+                return ri
         for ri, row in enumerate(rows):
             for c in row:
                 if c is None:
@@ -1103,11 +1142,28 @@ class ExcelPayslipImporter:
                 rows = []
                 for _, row in df.iterrows():
                     rows.append([None if pd.isna(v) else v for v in row])
-                data, err = ExcelPayslipImporter.parse_sheet(rows, sheet_name)
-                if err:
-                    errors.append(f"{sheet_name}: {err}")
-                elif data:
-                    results.append(data)
+
+                anchors = ExcelPayslipImporter._find_all_summary_row_indices(rows)
+                if len(anchors) <= 1:
+                    data, err = ExcelPayslipImporter.parse_sheet(rows, sheet_name)
+                    if err:
+                        errors.append(f"{sheet_name}: {err}")
+                    elif data:
+                        results.append(data)
+                    continue
+
+                for bi, pi in enumerate(anchors):
+                    start = max(0, pi - 14)
+                    end = anchors[bi + 1] if bi + 1 < len(anchors) else len(rows)
+                    if end <= start:
+                        continue
+                    sub = rows[start:end]
+                    tag = f"{sheet_name}#{bi + 1}"
+                    data, err = ExcelPayslipImporter.parse_sheet(sub, tag)
+                    if err:
+                        errors.append(f"{tag}: {err}")
+                    elif data:
+                        results.append(data)
             except Exception as e:
                 errors.append(f"{sheet_name}: {e}")
 
@@ -1117,7 +1173,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.7")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.8")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
