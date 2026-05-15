@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.16 (Excel EARNINGS grid stops at Total / PAYE / KiwiSaver rows)
+Version: 1.4.17 (Total from full-sheet meta; narrow bank… boundary)
 """
 
 import copy
@@ -600,7 +600,7 @@ class ExcelPayslipImporter:
     """
     Xero / 模板类工资单 Excel：
     - 多工作表或单表多块（按「Pay Period + Payment Date」汇总行切分）；
-    - 收入网格在遇到 **Total… / PAYE / KiwiSaver / Superannuation** 等行时结束，避免把税务与扣款 THIS PAY 误累加成收入。
+    - 若表头上方 blob 未含灰色汇总条，再用**整张表**文本补读 Total Earnings / Net（避免 Total 一直为 0）。
     - 共用表头下的「年假/病假」行不参与收入解析；汇总 Total/Net 均为 0 时丢弃误解析的大额明细。
     - 已定位到 THIS PAY 表头且首行即假期时，不启用全文 PDF 回退（避免 YTD/邻页数字混入）。
     - 姓名启发式见 `payslip_name_utils.payslip_name_is_plausible`（排除 Pay Frequency 等标签与地址行）。
@@ -991,7 +991,7 @@ class ExcelPayslipImporter:
             return True
         if re.match(r'^payments\b', low):
             return True
-        if re.match(r'^bank\s+', low):
+        if re.match(r'^bank\s+(payment|transfer|deposit|into)\b', low):
             return True
         return False
 
@@ -1191,9 +1191,14 @@ class ExcelPayslipImporter:
             if total_earnings < 1e-6 and sum_lines > 0:
                 total_earnings = sum_lines
 
+        full_blob = cls._rows_to_blob(rows, len(rows))
+        meta2 = cls._parse_meta_blob(full_blob)
+        if total_earnings < 1e-6:
+            te2 = float(meta2.get('total_earnings') or 0.0)
+            if te2 > 1e-6:
+                total_earnings = te2
+
         if net_pay < 1e-6:
-            full_blob = cls._rows_to_blob(rows, len(rows))
-            meta2 = cls._parse_meta_blob(full_blob)
             if abs(float(meta2.get('net_pay') or 0)) > 1e-9:
                 net_pay = float(meta2['net_pay'])
             if net_pay < 1e-6:
@@ -1268,7 +1273,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.16")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.17")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
