@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.13 (stricter payslip employee name: no Pay… labels / addresses)
+Version: 1.4.14 (skip LEAVE rows under shared THIS PAY header; trust $0 summary)
 """
 
 import copy
@@ -591,6 +591,8 @@ class ExcelPayslipImporter:
     Xero / 模板类工资单 Excel：
     - 多工作表或单表多块（按「Pay Period + Payment Date」汇总行切分）；
     - 收入金额只认 **THIS PAY**（单元格空则按 0），**绝不从 YTD 列补数**；YTD 仅用于表头定位。
+    - 共用表头下的「年假/病假」行不参与收入解析；汇总 Total/Net 均为 0 时丢弃误解析的大额明细。
+    - 已定位到 THIS PAY 表头且首行即假期时，不启用全文 PDF 回退（避免 YTD/邻页数字混入）。
     - 姓名启发式见 `payslip_name_utils.payslip_name_is_plausible`（排除 Pay Frequency 等标签与地址行）。
     """
 
@@ -915,6 +917,42 @@ class ExcelPayslipImporter:
         return ''
 
     @classmethod
+    def _row_looks_like_leave_not_earnings(cls, row, label: str) -> bool:
+        """
+        Xero 导出里「QUANTITY / RATE / THIS PAY / YTD」表头常与下方假期表共用列位；
+        年假/病假行不是 EARNINGS，若当收入解析会误读 BALANCE 等列成大额。
+        """
+        ls = (label or '').strip()
+        if not ls:
+            return False
+        ul = ls.upper()
+        if ul == 'LEAVE':
+            return True
+        low = ls.lower()
+        for frag in (
+            'annual leave',
+            'sick leave',
+            'parental leave',
+            'bereavement leave',
+            'long service leave',
+            'alternative leave',
+            'domestic violence leave',
+            'leave (hours)',
+        ):
+            if frag in low:
+                return True
+        joined = ' '.join(
+            str(c).strip().lower()
+            for c in row
+            if not cls._is_na(c) and str(c).strip()
+        )
+        if 'leave' in joined and 'accrued' in joined and 'balance' in joined:
+            return True
+        if 'leave' in joined and 'used' in joined and 'balance' in joined:
+            return True
+        return False
+
+    @classmethod
     def _parse_earnings_rows(cls, rows, data_start, this_pay_col, _ytd_col, qty_col, rate_col):
         earnings = []
         if this_pay_col is None:
@@ -937,6 +975,8 @@ class ExcelPayslipImporter:
             if ul == 'EARNINGS':
                 continue
             if ul == 'TOTAL' or ls.lower() == 'total':
+                break
+            if cls._row_looks_like_leave_not_earnings(row, ls):
                 break
 
             qty = (
@@ -976,6 +1016,8 @@ class ExcelPayslipImporter:
             lab = cls._first_label_cell(row, max(tp_col, 5))
             ul = (lab or '').strip().upper()
             if ul == 'TAX' or ul == 'LEAVE':
+                break
+            if cls._row_looks_like_leave_not_earnings(row, lab):
                 break
             if ul == 'TOTAL':
                 return cls._float_cell(row[tp_col]) if len(row) > tp_col else 0.0
@@ -1058,7 +1100,35 @@ class ExcelPayslipImporter:
                 rows, data_start, tp_col, ytd_col, qty_col, rate_col
             )
 
-        if not earnings:
+        meta_zero_summary = (
+            abs(float(meta.get('total_earnings') or 0.0)) < 1e-6
+            and abs(float(meta.get('net_pay') or 0.0)) < 1e-6
+        )
+        sum_pre = sum(e['amount'] for e in earnings)
+        if earnings and meta_zero_summary and sum_pre > 1e-6:
+            earnings = []
+
+        first_block_row_is_leave = False
+        if data_start is not None and tp_col is not None:
+            for ri in range(data_start, min(len(rows), data_start + 12)):
+                row = rows[ri]
+                if not row:
+                    continue
+                ls = cls._first_label_cell(row, max(tp_col - 1, 5))
+                if not ls:
+                    continue
+                if ls.upper() == 'EARNINGS':
+                    continue
+                first_block_row_is_leave = cls._row_looks_like_leave_not_earnings(row, ls)
+                break
+
+        skip_pdf_fallback = (
+            data_start is not None
+            and tp_col is not None
+            and (meta_zero_summary or first_block_row_is_leave)
+        )
+
+        if not earnings and not skip_pdf_fallback:
             full_text = cls._rows_to_blob(rows, len(rows))
             alt, _err = PDFPayrollParser.parse_text(full_text)
             if alt and alt.get('earnings'):
@@ -1158,7 +1228,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.13")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.14")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
