@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.10 (ignore YTD column: noise-free this-period import)
+Version: 1.4.11 (Excel totals follow THIS PAY line sums, not meta/YTD bleed)
 """
 
 import copy
@@ -1091,12 +1091,17 @@ class ExcelPayslipImporter:
                     net_pay = alt['net_pay']
 
         tp_tot = cls._earnings_block_total(rows, data_start, tp_col, ytd_col)
-        if total_earnings < 1e-6 and tp_tot is not None and tp_tot > 1e-6:
-            total_earnings = tp_tot
-
         sum_lines = sum(e['amount'] for e in earnings)
-        if total_earnings < 1e-6 and sum_lines > 0:
+
+        if earnings:
+            # 已从表网格解析出收入行：本期合计必须以 THIS PAY 明细为准，避免汇总区/全文
+            # 正则误把 YTD 或整段数字扫进 total_earnings（例如 Adrian 本期 0 却显示 3101.34）。
             total_earnings = sum_lines
+        else:
+            if total_earnings < 1e-6 and tp_tot is not None and tp_tot > 1e-6:
+                total_earnings = tp_tot
+            if total_earnings < 1e-6 and sum_lines > 0:
+                total_earnings = sum_lines
 
         if net_pay < 1e-6:
             full_blob = cls._rows_to_blob(rows, len(rows))
@@ -1107,6 +1112,8 @@ class ExcelPayslipImporter:
                 guessed = cls._infer_net_pay(rows, total_earnings, tp_col)
                 if guessed is not None and guessed > 1e-6:
                     net_pay = guessed
+        if net_pay > total_earnings + 1e-9:
+            net_pay = total_earnings
 
         result = {
             'name': name,
@@ -1173,7 +1180,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.10")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.11")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
