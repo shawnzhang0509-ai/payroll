@@ -14,6 +14,15 @@ _STREET_SUFFIX = re.compile(
     re.I,
 )
 
+# 门牌：1/67、Flat 67、全角/Unicode 分数斜杠
+_FLAT_PREFIX = re.compile(
+    r"^(.{2,60}?)\s+(?:"
+    r"\d+\s*[/／\u2044\u2215]\s*\d+|"  # 1/67、1／67、1⁄67
+    r"flat\s+\d+"
+    r")",
+    re.I,
+)
+
 
 def payslip_name_is_plausible(line: str) -> bool:
     """
@@ -112,19 +121,22 @@ def payslip_name_is_plausible(line: str) -> bool:
 
 def payslip_name_pick_from_cell_text(raw: str) -> str | None:
     """
-    From a merged Excel cell (name + flat number + street lines), return the
-    first plausible employee name line, preferring text before '1/67' style.
+    合并单元格内姓名在**最上面一行**；其下为门牌/街道，不在后续行上猜姓名
+    （避免把 Andrews Terrace 当成员工名）。
     """
     raw = (raw or "").replace("\r", "\n")
-    for line in raw.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        m = re.match(r"^(.{2,60}?)\s+\d+\s*/\s*\d+", line)
-        if m:
-            inner = m.group(1).strip()
-            if payslip_name_is_plausible(inner):
-                return inner
-        if payslip_name_is_plausible(line):
-            return line
+    lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+    if not lines:
+        return None
+    first = lines[0]
+
+    m = _FLAT_PREFIX.match(first)
+    if m:
+        inner = m.group(1).strip()
+        if payslip_name_is_plausible(inner):
+            return inner
+
+    if payslip_name_is_plausible(first):
+        return first
+
     return None
