@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.8 (Excel Table template: multiple payslips per sheet)
+Version: 1.4.10 (ignore YTD column: noise-free this-period import)
 """
 
 import copy
@@ -582,8 +582,8 @@ class ExcelHoursImporter:
 class ExcelPayslipImporter:
     """
     Xero / 模板类工资单 Excel：
-    - 多工作表（Table 1、P1…）每人一张；或
-    - 单表纵向多块（同一 Table 1 内多个员工），按「Pay Period + Payment Date」汇总行切分后逐块解析。
+    - 多工作表或单表多块（按「Pay Period + Payment Date」汇总行切分）；
+    - 收入金额只认 **THIS PAY**；**YTD 列视为噪音**，不参与 amount / 合计推断（表头可存在，仅用于定位）。
     """
 
     _SKIP_NAME_SUB = (
@@ -687,11 +687,20 @@ class ExcelPayslipImporter:
     @classmethod
     def _find_earnings_columns(cls, rows):
         """
-        Locate THIS PAY / YTD columns (often on same row; Xero 也可能拆成两行表头).
-        Returns (header_last_row_idx, data_start_row, this_pay_col, ytd_col, qty_col, rate_col)
+        定位 QUANTITY / RATE / THIS PAY（及表头中的 YTD 列位置，仅用于跳过重复表头，不读取其金额）。
+        若表头无 YTD，则假定其在 THIS PAY 右侧一列。
         """
         this_pay_col = ytd_col = qty_col = rate_col = None
         header_last = None
+
+        def commit(tp, yt, qc, rc, last_row_idx):
+            nonlocal this_pay_col, ytd_col, qty_col, rate_col, header_last
+            if tp is None:
+                return False
+            header_last = last_row_idx
+            this_pay_col, qty_col, rate_col = tp, qc, rc
+            ytd_col = yt if yt is not None else tp + 1
+            return True
 
         for ri, row in enumerate(rows):
             tp = yt = qc = rc = None
@@ -709,12 +718,10 @@ class ExcelPayslipImporter:
                 elif t == 'rate' or (t.startswith('rate') and len(t) < 14):
                     rc = ci
 
-            if tp is not None and yt is not None:
-                header_last = ri
-                this_pay_col, ytd_col, qty_col, rate_col = tp, yt, qc, rc
+            if commit(tp, yt, qc, rc, ri):
                 break
 
-        if this_pay_col is None or ytd_col is None:
+        if header_last is None:
             for ri in range(len(rows) - 1):
                 tp = yt = qc = rc = None
                 max_c = max(len(rows[ri]), len(rows[ri + 1]))
@@ -735,12 +742,10 @@ class ExcelPayslipImporter:
                             qc = ci
                         elif t == 'rate' or (t.startswith('rate') and len(t) < 14):
                             rc = ci
-                if tp is not None and yt is not None:
-                    header_last = ri + 1
-                    this_pay_col, ytd_col, qty_col, rate_col = tp, yt, qc, rc
+                if commit(tp, yt, qc, rc, ri + 1):
                     break
 
-        if this_pay_col is None or ytd_col is None:
+        if header_last is None:
             for ri, row in enumerate(rows):
                 joined = ' '.join(str(c).lower() for c in row if c is not None)
                 if 'earnings' not in joined or 'quantity' not in joined:
@@ -759,14 +764,13 @@ class ExcelPayslipImporter:
                         qc_c = ci
                     elif t == 'rate' or (t.startswith('rate') and len(t) < 14):
                         rc_c = ci
-                if tp_c is not None and yt_c is not None:
-                    header_last = ri
-                    this_pay_col, ytd_col, qty_col, rate_col = tp_c, yt_c, qc_c, rc_c
+                if commit(tp_c, yt_c, qc_c, rc_c, ri):
                     break
                 if len(row) >= 5:
                     header_last = ri
                     this_pay_col = 3
                     ytd_col = 4
+                    qty_col = rate_col = None
                     break
 
         if header_last is None:
@@ -776,13 +780,17 @@ class ExcelPayslipImporter:
         while data_start < len(rows):
             r = rows[data_start]
             joined = ' '.join(str(c).strip().lower() for c in r if not cls._is_na(c))
-            if joined and all(
-                x in joined
-                for x in ('this pay', 'ytd')
+            if not joined:
+                break
+            if (
+                'quantity' in joined
+                and 'rate' in joined
+                and 'this pay' in joined
+                and 'earnings' not in joined
             ):
                 data_start += 1
                 continue
-            if joined == 'quantity rate this pay ytd' or joined.startswith('quantity '):
+            if joined == 'quantity rate this pay ytd' or joined.startswith('quantity rate this pay'):
                 data_start += 1
                 continue
             break
@@ -979,26 +987,21 @@ class ExcelPayslipImporter:
         return earnings
 
     @classmethod
-    def _earnings_block_total(cls, rows, data_start, tp_col, ytd_col):
-        """
-        Xero 表单式导出：汇总行 Total Earnings 常为 $0，但 EARNINGS 块末行 TOTAL 的
-        THIS PAY / YTD 列才是可信合计。
-        """
-        if data_start is None or tp_col is None or ytd_col is None:
-            return None, None
+    def _earnings_block_total(cls, rows, data_start, tp_col, ytd_col=None):
+        """EARNINGS 块末行 TOTAL 的 THIS PAY 列（不读 YTD）。"""
+        if data_start is None or tp_col is None:
+            return None
         for ri in range(data_start, len(rows)):
             row = rows[ri]
             if not row:
                 continue
-            lab = cls._first_label_cell(row, max(tp_col, ytd_col, 5))
+            lab = cls._first_label_cell(row, max(tp_col, 5))
             ul = (lab or '').strip().upper()
             if ul == 'TAX' or ul == 'LEAVE':
                 break
             if ul == 'TOTAL':
-                tp = cls._float_cell(row[tp_col]) if len(row) > tp_col else 0.0
-                yt = cls._float_cell(row[ytd_col]) if len(row) > ytd_col else 0.0
-                return tp, yt
-        return None, None
+                return cls._float_cell(row[tp_col]) if len(row) > tp_col else 0.0
+        return None
 
     @classmethod
     def _find_paye_this_period(cls, rows, tp_col):
@@ -1087,12 +1090,9 @@ class ExcelPayslipImporter:
                 if net_pay == 0 and alt.get('net_pay'):
                     net_pay = alt['net_pay']
 
-        tp_tot, ytd_tot = cls._earnings_block_total(rows, data_start, tp_col, ytd_col)
-        if total_earnings < 1e-6:
-            if tp_tot is not None and tp_tot > 1e-6:
-                total_earnings = tp_tot
-            elif ytd_tot is not None and ytd_tot > 1e-6:
-                total_earnings = ytd_tot
+        tp_tot = cls._earnings_block_total(rows, data_start, tp_col, ytd_col)
+        if total_earnings < 1e-6 and tp_tot is not None and tp_tot > 1e-6:
+            total_earnings = tp_tot
 
         sum_lines = sum(e['amount'] for e in earnings)
         if total_earnings < 1e-6 and sum_lines > 0:
@@ -1173,7 +1173,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.8")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.10")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()

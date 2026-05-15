@@ -505,7 +505,7 @@ def parse_payslip_export_dict(text: str) -> dict:
             continue
         if "QUANTITY" in line and "RATE" in line:
             continue
-        if "THIS PAY" in line and "YTD" in line:
+        if "QUANTITY" in line and "RATE" in line and "THIS PAY" in line:
             continue
 
         amounts_found = re.findall(r"\$([\d,]+(?:\.\d+)?)", line)
@@ -517,10 +517,8 @@ def parse_payslip_export_dict(text: str) -> dict:
 
         if len(amounts_found) >= 2:
             this_pay = float(amounts_found[-2].replace(",", ""))
-            ytd = float(amounts_found[-1].replace(",", ""))
         else:
             this_pay = float(amounts_found[-1].replace(",", ""))
-            ytd = None
 
         item_text = line
         for amt in amounts_found:
@@ -546,7 +544,6 @@ def parse_payslip_export_dict(text: str) -> dict:
                 "quantity": quantity,
                 "rate": rate,
                 "this_pay": this_pay,
-                "ytd": ytd,
             }
         )
 
@@ -566,7 +563,6 @@ def parse_payslip_export_dict(text: str) -> dict:
                     {
                         "name": "PAYE",
                         "this_pay": float(amts[0].replace(",", "")),
-                        "ytd": float(amts[1].replace(",", "")) if len(amts) > 1 else None,
                     }
                 )
 
@@ -659,7 +655,7 @@ def payslip_dict_to_sheet_rows(d: dict) -> list[list[str]]:
         ]
     )
     add([])
-    add(["EARNINGS", "QUANTITY", "RATE", "THIS PAY", "YTD"])
+    add(["EARNINGS", "QUANTITY", "RATE", "THIS PAY", ""])
     for e in d.get("earnings") or []:
         add(
             [
@@ -667,24 +663,21 @@ def payslip_dict_to_sheet_rows(d: dict) -> list[list[str]]:
                 _fmt_qty(e.get("quantity")) if e.get("quantity") is not None else "",
                 _fmt_qty(e.get("rate")) if e.get("rate") is not None else "",
                 _fmt_money(e.get("this_pay")),
-                _fmt_money(e.get("ytd")) if e.get("ytd") is not None else "",
+                "",
             ]
         )
     te_sum = sum((x.get("this_pay") or 0) for x in (d.get("earnings") or []) if isinstance(x.get("this_pay"), (int, float)))
-    ytd_sum = sum((x.get("ytd") or 0) for x in (d.get("earnings") or []) if isinstance(x.get("ytd"), (int, float)))
     if d.get("earnings"):
         te_cell = d.get("total_earnings")
         tp = _fmt_money(te_cell if te_cell is not None else te_sum)
-        ytd_cell = _fmt_money(ytd_sum) if ytd_sum else ""
-        add(["TOTAL", "", "", tp, ytd_cell])
+        add(["TOTAL", "", "", tp, ""])
     if d.get("tax_rows"):
         add([])
-        add(["TAX", "", "", "THIS PAY", "YTD"])
+        add(["TAX", "", "", "THIS PAY", ""])
         for tr in d["tax_rows"]:
-            add([tr.get("name") or "", "", "", _fmt_money(tr.get("this_pay")), _fmt_money(tr.get("ytd"))])
+            add([tr.get("name") or "", "", "", _fmt_money(tr.get("this_pay")), ""])
         t_this = sum(x.get("this_pay") or 0 for x in d["tax_rows"] if isinstance(x.get("this_pay"), (int, float)))
-        t_ytd = sum(x.get("ytd") or 0 for x in d["tax_rows"] if isinstance(x.get("ytd"), (int, float)))
-        add(["TOTAL", "", "", _fmt_money(t_this), _fmt_money(t_ytd) if t_ytd else ""])
+        add(["TOTAL", "", "", _fmt_money(t_this), ""])
     if d.get("payments"):
         add([])
         add(["PAYMENTS", "PARTICULARS", "CODE", "REFERENCE", "AMOUNT"])
