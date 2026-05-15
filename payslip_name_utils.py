@@ -23,6 +23,14 @@ _FLAT_PREFIX = re.compile(
     re.I,
 )
 
+# 两词路名：「Andrews Terrace」等（第二词为常见街道类后缀）
+_STREET_SECOND_TOKEN = frozenset({
+    'terrace', 'road', 'street', 'crescent', 'drive', 'avenue', 'place',
+    'court', 'close', 'lane', 'way', 'rise', 'grove', 'mews', 'circuit',
+    'parade', 'square', 'boulevard', 'highway', 'esplanade', 'ridge',
+    'heights', 'crest', 'loop',
+})
+
 
 def payslip_name_is_plausible(line: str) -> bool:
     """
@@ -91,6 +99,8 @@ def payslip_name_is_plausible(line: str) -> bool:
         return False
 
     parts = line.split()
+    if len(parts) == 2 and parts[-1].lower() in _STREET_SECOND_TOKEN:
+        return False
     if len(parts) >= 2 and _STREET_SUFFIX.search(line):
         return False
 

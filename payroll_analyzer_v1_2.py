@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.18 (name from top line of cell only; prefer full address block cell)
+Version: 1.4.19 (UI shows payslip name; global name guess; sync Employee.name)
 """
 
 import copy
@@ -284,9 +284,15 @@ class PayrollDatabase:
 
     def get_or_create_employee(self, name, name_key=None, branch="未分配"):
         key = name_key or name.lower().strip()
+        nm = (name or '').strip()
         if key not in self.employees:
-            self.employees[key] = Employee(name, key, branch)
+            self.employees[key] = Employee(nm or '未命名', key, branch)
             self.save_data()
+        else:
+            emp = self.employees[key]
+            if nm and payslip_name_is_plausible(nm) and emp.name != nm:
+                emp.name = nm
+                self.save_data()
         return self.employees[key]
 
     def set_employee_branch(self, name_key, branch):
@@ -828,12 +834,14 @@ class ExcelPayslipImporter:
                 ordered_indices.append(ri)
 
         seen = set()
+        global_best = None
+        global_rank = -1
         for ri in ordered_indices:
             if ri in seen:
                 continue
             seen.add(ri)
-            best = None
-            best_rank = -1
+            row_best = None
+            row_best_rank = -1
             for c in rows[ri]:
                 if cls._is_na(c):
                     continue
@@ -848,12 +856,13 @@ class ExcelPayslipImporter:
                     lines[0],
                 ):
                     rank += 40
-                if rank > best_rank:
-                    best_rank = rank
-                    best = picked
-            if best:
-                return best
-        return None
+                if rank > row_best_rank:
+                    row_best_rank = rank
+                    row_best = picked
+            if row_best is not None and row_best_rank > global_rank:
+                global_rank = row_best_rank
+                global_best = row_best
+        return global_best
 
     @classmethod
     def _parse_meta_blob(cls, blob):
@@ -1287,7 +1296,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.18")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.19")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
@@ -2025,8 +2034,16 @@ class PayrollAnalyzer(QMainWindow):
             if week_id and week_id in self.db.history and emp_key in self.db.history[week_id]:
                 payroll = self.db.history[week_id][emp_key]
 
+            display_name = (
+                (payroll.get('name') or '').strip() or emp.name
+                if payroll
+                else emp.name
+            )
+            if search_text and search_text not in display_name.lower() and search_text not in emp.english_name.lower():
+                continue
+
             rows.append({
-                'name': emp.name,
+                'name': display_name,
                 'english_name': emp.english_name,
                 'branch': emp.branch,
                 'hours': payroll.get('hours', 0) if payroll else 0,
