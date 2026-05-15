@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.10 (ignore YTD column: noise-free this-period import)
+Version: 1.4.12 (THIS PAY empty => 0; never backfill from YTD)
 """
 
 import copy
@@ -583,7 +583,7 @@ class ExcelPayslipImporter:
     """
     Xero / 模板类工资单 Excel：
     - 多工作表或单表多块（按「Pay Period + Payment Date」汇总行切分）；
-    - 收入金额只认 **THIS PAY**；**YTD 列视为噪音**，不参与 amount / 合计推断（表头可存在，仅用于定位）。
+    - 收入金额只认 **THIS PAY**（单元格空则按 0），**绝不从 YTD 列补数**；YTD 仅用于表头定位。
     """
 
     _SKIP_NAME_SUB = (
@@ -930,7 +930,7 @@ class ExcelPayslipImporter:
         return ''
 
     @classmethod
-    def _parse_earnings_rows(cls, rows, data_start, this_pay_col, ytd_col, qty_col, rate_col):
+    def _parse_earnings_rows(cls, rows, data_start, this_pay_col, _ytd_col, qty_col, rate_col):
         earnings = []
         if this_pay_col is None:
             return earnings
@@ -940,7 +940,6 @@ class ExcelPayslipImporter:
             if not row:
                 continue
 
-            lim = this_pay_col + 1 if this_pay_col is not None else 6
             ls = cls._first_label_cell(row, max(this_pay_col - 1, 5))
             ul = ls.upper()
 
@@ -970,12 +969,6 @@ class ExcelPayslipImporter:
                 if len(row) > this_pay_col
                 else 0.0
             )
-
-            if abs(amt) < 1e-9 and ytd_col is not None and len(row) > ytd_col:
-                amt = cls._float_cell(row[ytd_col])
-
-            if abs(amt) < 1e-9:
-                continue
 
             earnings.append({
                 'name': ls,
@@ -1091,12 +1084,15 @@ class ExcelPayslipImporter:
                     net_pay = alt['net_pay']
 
         tp_tot = cls._earnings_block_total(rows, data_start, tp_col, ytd_col)
-        if total_earnings < 1e-6 and tp_tot is not None and tp_tot > 1e-6:
-            total_earnings = tp_tot
-
         sum_lines = sum(e['amount'] for e in earnings)
-        if total_earnings < 1e-6 and sum_lines > 0:
+
+        if earnings:
             total_earnings = sum_lines
+        else:
+            if total_earnings < 1e-6 and tp_tot is not None and tp_tot > 1e-6:
+                total_earnings = tp_tot
+            if total_earnings < 1e-6 and sum_lines > 0:
+                total_earnings = sum_lines
 
         if net_pay < 1e-6:
             full_blob = cls._rows_to_blob(rows, len(rows))
@@ -1107,6 +1103,8 @@ class ExcelPayslipImporter:
                 guessed = cls._infer_net_pay(rows, total_earnings, tp_col)
                 if guessed is not None and guessed > 1e-6:
                     net_pay = guessed
+        if net_pay > total_earnings + 1e-9:
+            net_pay = total_earnings
 
         result = {
             'name': name,
@@ -1173,7 +1171,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.10")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.12")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
