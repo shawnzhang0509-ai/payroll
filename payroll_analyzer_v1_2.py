@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.17 (Total from full-sheet meta; narrow bank… boundary)
+Version: 1.4.18 (name from top line of cell only; prefer full address block cell)
 """
 
 import copy
@@ -817,7 +817,7 @@ class ExcelPayslipImporter:
 
     @classmethod
     def _guess_name(cls, rows, pay_row_idx):
-        """优先 Pay Period 行上方的姓名格；支持合并单元格内换行。"""
+        """优先 Pay Period 行上方的姓名格；合并单元格只读最顶行，多格时偏好含门牌分式的整块地址格。"""
         ordered_indices = []
         for d in range(1, 10):
             ri = pay_row_idx - d
@@ -832,13 +832,27 @@ class ExcelPayslipImporter:
             if ri in seen:
                 continue
             seen.add(ri)
+            best = None
+            best_rank = -1
             for c in rows[ri]:
                 if cls._is_na(c):
                     continue
                 raw = str(c).replace('\r', '\n')
                 picked = payslip_name_pick_from_cell_text(raw)
-                if picked:
-                    return picked
+                if not picked:
+                    continue
+                lines = [ln.strip() for ln in raw.split('\n') if ln.strip()]
+                rank = 10 * len(lines) + len(picked.split())
+                if lines and re.search(
+                    r'\d\s*[/／\u2044\u2215]\s*\d',
+                    lines[0],
+                ):
+                    rank += 40
+                if rank > best_rank:
+                    best_rank = rank
+                    best = picked
+            if best:
+                return best
         return None
 
     @classmethod
@@ -1273,7 +1287,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.17")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.18")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
