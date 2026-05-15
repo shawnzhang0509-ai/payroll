@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.20 (Payslip week replace + heal/prune bad employee names from JSON)
+Version: 1.4.21 (Employee name: history payslip over JSON; merged payroll_config defaults)
 """
 
 import copy
@@ -102,7 +102,10 @@ DEFAULT_CONFIG = {
             "description": "其他收入或未分类项目"
         }
     },
-    "history_file": "payroll_history.json"
+    "history_file": "payroll_history.json",
+    # 员工「姓名」以谁为准：history_first=各周工资单里解析到的 name（可信时）覆盖 JSON 主档；
+    # json_employee_first=仍以 payroll_history.json 的 employees[].name 为主，仅主档明显错误时才用 history 修补。
+    "employee_name_source": "history_first",
 }
 
 
@@ -218,24 +221,52 @@ class PayrollDatabase:
                 self.history = data.get('history', {})
             except Exception as e:
                 print(f"加载历史数据失败: {e}")
-        self._heal_employee_names_from_history()
+        self._sync_employee_names_from_history()
         self.prune_orphan_implausible_employees()
 
-    def _heal_employee_names_from_history(self):
-        """若主档姓名为地址/噪声，用各周 history 里同 name_key 下可信的 payslip name 覆盖。"""
-        for _nk, emp in self.employees.items():
-            if payslip_name_is_plausible(emp.name):
-                continue
+    def _sync_employee_names_from_history(self):
+        """
+        同步 Employee.name 与周工资数据：默认 history_first，JSON employees 里的姓名
+        不作为最高优先级；以最新一周起往回找第一个可信的 payroll['name'] 为准。
+        """
+        mode = self.config.get('employee_name_source', 'history_first')
+        if mode == 'json_employee_first':
+            for _nk, emp in self.employees.items():
+                if payslip_name_is_plausible(emp.name):
+                    continue
+                best = None
+                for wk in sorted(self.history.keys(), reverse=True):
+                    rec = self.history[wk].get(emp.name_key)
+                    if not isinstance(rec, dict):
+                        continue
+                    cand = (rec.get('name') or '').strip()
+                    if payslip_name_is_plausible(cand):
+                        best = cand
+                        break
+                if best:
+                    emp.name = best
+            return
+
+        all_keys = set(self.employees.keys())
+        for rows in self.history.values():
+            if isinstance(rows, dict):
+                all_keys.update(rows.keys())
+        for nk in all_keys:
             best = None
             for wk in sorted(self.history.keys(), reverse=True):
-                rec = self.history[wk].get(emp.name_key)
+                rec = self.history[wk].get(nk)
                 if not isinstance(rec, dict):
                     continue
                 cand = (rec.get('name') or '').strip()
                 if payslip_name_is_plausible(cand):
                     best = cand
                     break
-            if best:
+            emp = self.employees.get(nk)
+            if not best:
+                continue
+            if emp is None:
+                self.employees[nk] = Employee(best, nk, '未分配', '')
+            else:
                 emp.name = best
 
     def prune_orphan_implausible_employees(self):
@@ -325,7 +356,7 @@ class PayrollDatabase:
         if import_mapping and data.get('category_mapping'):
             self.mapping_rules = copy.deepcopy(data['category_mapping'])
 
-        self._heal_employee_names_from_history()
+        self._sync_employee_names_from_history()
         self.prune_orphan_implausible_employees()
 
     def get_or_create_employee(self, name, name_key=None, branch="未分配"):
@@ -1343,7 +1374,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.20")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.21")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
@@ -1355,11 +1386,14 @@ class PayrollAnalyzer(QMainWindow):
         self.refresh_all()
 
     def load_config(self):
+        cfg = DEFAULT_CONFIG.copy()
         config_file = 'payroll_config.json'
         if os.path.exists(config_file):
             with open(config_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return DEFAULT_CONFIG.copy()
+                user = json.load(f)
+            if isinstance(user, dict):
+                cfg.update(user)
+        return cfg
 
     def save_config(self):
         atomic_write_json('payroll_config.json', self.config)
@@ -1822,6 +1856,7 @@ class PayrollAnalyzer(QMainWindow):
             payroll.update(categorized)
             self.db.history[week_id][name_key] = payroll
 
+        self.db._sync_employee_names_from_history()
         self.db.prune_orphan_implausible_employees()
         self.db.save_data()
         self.status.showMessage(f"成功导入 {len(all_data)} 条工资单到 {week_id}")
