@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.12 (THIS PAY empty => 0; never backfill from YTD)
+Version: 1.4.13 (stricter payslip employee name: no Pay… labels / addresses)
 """
 
 import copy
@@ -18,6 +18,8 @@ from pathlib import Path
 from collections import defaultdict
 
 import traceback
+
+from payslip_name_utils import payslip_name_is_plausible
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -438,8 +440,13 @@ class PDFPayrollParser:
             ):
                 m = re.search(pattern, text, re.I)
                 if m:
-                    name = m.group(1).strip()
-                    break
+                    cand = m.group(1).strip()
+                    if payslip_name_is_plausible(cand):
+                        name = cand
+                        break
+
+        if name and not payslip_name_is_plausible(name):
+            name = None
 
         pp_match = re.search(r'Pay Period:\s*([\d\s\w\-–]+)', text)
         if pp_match:
@@ -584,13 +591,8 @@ class ExcelPayslipImporter:
     Xero / 模板类工资单 Excel：
     - 多工作表或单表多块（按「Pay Period + Payment Date」汇总行切分）；
     - 收入金额只认 **THIS PAY**（单元格空则按 0），**绝不从 YTD 列补数**；YTD 仅用于表头定位。
+    - 姓名启发式见 `payslip_name_utils.payslip_name_is_plausible`（排除 Pay Frequency 等标签与地址行）。
     """
-
-    _SKIP_NAME_SUB = (
-        'employment', 'pay frequency', 'ird', 'tax code', 'tax period',
-        'details', 'weekly', 'fortnightly', 'monthly', 'number',
-        'pay period', 'payment date', 'total earnings', 'net pay',
-    )
 
     @staticmethod
     def _is_na(v):
@@ -799,26 +801,7 @@ class ExcelPayslipImporter:
 
     @classmethod
     def _looks_like_person_name(cls, line):
-        line = line.strip()
-        if len(line) < 3 or len(line) > 70:
-            return False
-        low = line.lower()
-        if any(sk in low for sk in cls._SKIP_NAME_SUB):
-            return False
-        if ':' in line and len(line) < 55:
-            return False
-        if re.search(r'\d{4,}', line):
-            return False
-        if re.match(r'^[\d\s$,.%-]+$', line):
-            return False
-        # Latin letters + Māori diacritics + 中文
-        return bool(
-            re.match(
-                r"^[\s'A-Za-z\u0080-\u024f\u4e00-\u9fff]"
-                r"[\s'A-Za-z\u0080-\u024f\u4e00-\u9fff.\-]{2,}$",
-                line,
-            )
-        )
+        return payslip_name_is_plausible(line)
 
     @classmethod
     def _guess_name(cls, rows, pay_row_idx):
@@ -857,7 +840,7 @@ class ExcelPayslipImporter:
         m = re.search(r'EMPLOYMENT DETAILS\s*\n?\s*([^\n]{1,120})', blob)
         if m:
             raw = m.group(1).strip()
-            if 'pay frequency' not in raw.lower() and len(raw) < 90:
+            if payslip_name_is_plausible(raw):
                 name = raw
 
         if not name:
@@ -868,8 +851,10 @@ class ExcelPayslipImporter:
             ):
                 m = re.search(pattern, blob, re.I)
                 if m:
-                    name = m.group(1).strip()
-                    break
+                    cand = m.group(1).strip()
+                    if payslip_name_is_plausible(cand):
+                        name = cand
+                        break
 
         m = re.search(r'Pay Period:\s*([\d\s\w\-–]+)', blob)
         if m:
@@ -1055,9 +1040,11 @@ class ExcelPayslipImporter:
 
         meta = cls._parse_meta_blob(blob)
         name = cls._guess_name(rows, pay_idx)
+        if name and not payslip_name_is_plausible(name):
+            name = None
         if not name:
             cand = meta.get('name')
-            if cand and 'pay frequency' not in cand.lower() and len(cand) < 90:
+            if cand and payslip_name_is_plausible(cand.strip()):
                 name = cand.strip()
 
         pay_period = meta.get('pay_period') or ''
@@ -1076,7 +1063,7 @@ class ExcelPayslipImporter:
             alt, _err = PDFPayrollParser.parse_text(full_text)
             if alt and alt.get('earnings'):
                 earnings = alt['earnings']
-                if not name and alt.get('name'):
+                if not name and alt.get('name') and payslip_name_is_plausible(alt['name']):
                     name = alt['name']
                 if total_earnings == 0 and alt.get('total_earnings'):
                     total_earnings = alt['total_earnings']
@@ -1171,7 +1158,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.12")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.13")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()

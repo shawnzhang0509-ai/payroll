@@ -29,6 +29,8 @@ except ImportError:
 
 import pandas as pd
 
+from payslip_name_utils import payslip_name_is_plausible
+
 
 def _safe_sheet_base(name: str) -> str:
     name = re.sub(r"[\[\]:*?/\\]", "_", (name or "").strip())
@@ -311,9 +313,9 @@ def _looks_like_person_line(s: str) -> bool:
     s = (s or "").strip()
     if len(s) < 4 or len(s) > 80:
         return False
-    if re.search(r"\d{2}-\d{4}-\d+", s):
+    if not payslip_name_is_plausible(s):
         return False
-    if any(k in s.lower() for k in ("pay period", "payment date", "earnings", "employment", "weekly", "fortnight")):
+    if re.search(r"\d{2}-\d{4}-\d+", s):
         return False
     parts = s.split()
     if len(parts) < 2:
@@ -423,7 +425,7 @@ def parse_payslip_export_dict(text: str) -> dict:
     nm = re.search(r"EMPLOYMENT DETAILS\s*\n?\s*([^\n]+)", t)
     if nm:
         cand = nm.group(1).strip()
-        if not any(x in cand.lower() for x in ("pay frequency", "weekly", "ird", "tax code")):
+        if payslip_name_is_plausible(cand):
             name = cand
 
     pay_period = None
@@ -474,7 +476,7 @@ def parse_payslip_export_dict(text: str) -> dict:
             break
 
     g_name, g_addr = _guess_name_address(lines)
-    if not name:
+    if not name and g_name and payslip_name_is_plausible(g_name):
         name = g_name
     address_lines = g_addr
 
