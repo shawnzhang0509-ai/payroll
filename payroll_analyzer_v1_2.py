@@ -440,8 +440,10 @@ class PDFPayrollParser:
             ):
                 m = re.search(pattern, text, re.I)
                 if m:
-                    name = m.group(1).strip()
-                    break
+                    cand = m.group(1).strip()
+                    if payslip_name_is_plausible(cand):
+                        name = cand
+                        break
 
         if name and not payslip_name_is_plausible(name):
             name = None
