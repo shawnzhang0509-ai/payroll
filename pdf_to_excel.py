@@ -29,7 +29,7 @@ except ImportError:
 
 import pandas as pd
 
-from payslip_name_utils import payslip_name_is_plausible
+from payslip_name_utils import payslip_name_is_plausible, payslip_name_pick_from_cell_text
 
 
 def _safe_sheet_base(name: str) -> str:
@@ -341,9 +341,11 @@ def _guess_name_address(lines: list[str]) -> tuple[str | None, list[str]]:
             break
         if "EARNINGS" in u and "QUANTITY" in u:
             break
-        if name is None and _looks_like_person_line(s):
-            name = s
-            continue
+        if name is None:
+            picked = payslip_name_pick_from_cell_text(s)
+            if picked:
+                name = picked
+                continue
         if name and not addr and (re.search(r"\d", s) or "auckland" in s.lower() or "/" in s):
             addr.append(s)
             if len(addr) >= 3:

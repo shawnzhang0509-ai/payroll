@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud 7 Payroll Analyzer - 工资单分析系统
-Version: 1.4.14 (skip LEAVE rows under shared THIS PAY header; trust $0 summary)
+Version: 1.4.15 (name: flat/address reject; mapping keywords word-aware)
 """
 
 import copy
@@ -19,7 +19,7 @@ from collections import defaultdict
 
 import traceback
 
-from payslip_name_utils import payslip_name_is_plausible
+from payslip_name_utils import payslip_name_is_plausible, payslip_name_pick_from_cell_text
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -72,7 +72,7 @@ DEFAULT_CONFIG = {
         "labor_cost": {
             "name": "真正工时成本",
             "color": "#2E86AB",
-            "keywords": ["Ordinary Time", "Salary", "Ordinary"],
+            "keywords": ["Ordinary Time", "Salary"],
             "description": "基于实际工作时间的直接劳动成本"
         },
         "benefits": {
@@ -104,6 +104,16 @@ DEFAULT_CONFIG = {
     },
     "history_file": "payroll_history.json"
 }
+
+
+def _mapping_keyword_matches(item_lower: str, kw: str) -> bool:
+    """Phrase keywords: substring. Short single tokens: non-alnum boundaries."""
+    k = (kw or "").strip().lower()
+    if not k:
+        return False
+    if " " in k or len(k) >= 12:
+        return k in item_lower
+    return bool(re.search(rf"(?<![a-z0-9]){re.escape(k)}(?![a-z0-9])", item_lower))
 
 
 def branch_canonical_key(name: str) -> str:
@@ -826,10 +836,9 @@ class ExcelPayslipImporter:
                 if cls._is_na(c):
                     continue
                 raw = str(c).replace('\r', '\n')
-                for line in raw.split('\n'):
-                    line = line.strip()
-                    if cls._looks_like_person_name(line):
-                        return line
+                picked = payslip_name_pick_from_cell_text(raw)
+                if picked:
+                    return picked
         return None
 
     @classmethod
@@ -1228,7 +1237,7 @@ class ExcelPayslipImporter:
 class PayrollAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.14")
+        self.setWindowTitle("Cloud 7 Payroll Analyzer - 工资单分析系统 v1.4.15")
         self.setGeometry(100, 100, 1400, 900)
 
         self.config = self.load_config()
@@ -1683,13 +1692,17 @@ class PayrollAnalyzer(QMainWindow):
 
                 for cat_id, rule in self.db.mapping_rules.items():
                     keywords = rule.get('keywords', [])
-                    if any(kw.lower() in item_name_lower for kw in keywords):
+                    if any(_mapping_keyword_matches(item_name_lower, kw) for kw in keywords):
                         categorized[cat_id] += item['amount']
                         assigned = True
                         break
 
                 if not assigned:
                     categorized['other'] += item['amount']
+
+            te = float(data.get('total_earnings') or 0.0)
+            if te < 1e-6:
+                categorized = {k: 0.0 for k in categorized}
 
             payroll.update(categorized)
             self.db.history[week_id][name_key] = payroll
